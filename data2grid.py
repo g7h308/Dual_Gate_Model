@@ -1,39 +1,42 @@
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
+import os
+import glob
 from sklearn.preprocessing import StandardScaler
 from scipy.interpolate import griddata
 
 
-def process_sensor_data(file_path):
+# ==========================================
+# 1. 核心处理函数 (包含标准化、插值、角落平均)
+# ==========================================
+def process_single_file(file_path):
     """
-    读取Excel，标准化数据，并将其转换为 5x9 插值矩阵
+    处理单个 Excel 文件，返回 (N, 5, 9) 的矩阵数组
     """
-    print(f"正在读取文件: {file_path} ...")
-
-    # 1. 读取数据
-    # 如果第一行是标题，请去掉 header=None；如果没有标题，保留 header=None
+    # 1. 读取
     try:
         df = pd.read_excel(file_path, header=None)
-    except FileNotFoundError:
-        print("错误：找不到文件，请检查路径。")
+    except Exception as e:
+        print(f"  [失败] 无法读取文件 {os.path.basename(file_path)}: {e}")
         return None
 
     data = df.values
 
-    # 检查列数
+    # 校验列数
     if data.shape[1] < 22:
-        print(f"错误：数据列数不足22列 (当前: {data.shape[1]})")
+        print(f"  [跳过] 列数不足 ({data.shape[1]} < 22): {os.path.basename(file_path)}")
         return None
 
-    # 截取前22列
     sensor_data = data[:, :22]
 
-    # 2. 标准化 (Z-score)
+    # 2. 标准化 (Standardization)
+    # 注意：这里是对【当前文件】进行独立标准化。
+    # 如果希望所有文件统一标准，需要先合并所有数据再标准化(消耗内存大)，
+    # 或者保存scaler参数。通常独立标准化也是可行的。
     scaler = StandardScaler()
     data_norm = scaler.fit_transform(sensor_data)
 
-    # 3. 定义坐标映射 (0-21)
+    # 3. 坐标映射与网格构建
     coords_map = {
         0: (0, 1), 1: (0, 3), 2: (0, 5), 3: (0, 7),
         4: (1, 0), 5: (1, 2), 6: (1, 4), 7: (1, 6), 8: (1, 8),
@@ -41,49 +44,102 @@ def process_sensor_data(file_path):
         13: (3, 0), 14: (3, 2), 15: (3, 4), 16: (3, 6), 17: (3, 8),
         18: (4, 1), 19: (4, 3), 20: (4, 5), 21: (4, 7)
     }
-
-    # 提取坐标点
     points = np.array([coords_map[i] for i in range(22)])
-    # 创建 5x9 网格
     grid_x, grid_y = np.mgrid[0:5:1, 0:9:1]
 
     processed_matrices = []
 
-    print(f"正在处理 {len(data_norm)} 行数据...")
-
-    # 4. 逐行插值
+    # 4. 逐行插值处理
     for row_values in data_norm:
-        # 第一步：三次样条插值 (平滑，但边缘可能是NaN)
+        # A. 三次样条插值 (Cubic)
         grid_z = griddata(points, row_values, (grid_x, grid_y), method='cubic')
 
-        # 第二步：填充NaN (使用最近邻插值填补角落)
+        # B. 填充 NaN (Nearest)
         if np.isnan(grid_z).any():
             grid_z_nearest = griddata(points, row_values, (grid_x, grid_y), method='nearest')
             grid_z[np.isnan(grid_z)] = grid_z_nearest[np.isnan(grid_z)]
 
+        # C. 修正四个角落 (取平均值)
+        # 左上 (0,0)
+        grid_z[0, 0] = (grid_z[0, 1] + grid_z[1, 0]) / 2.0
+        # 右上 (0,8)
+        grid_z[0, 8] = (grid_z[0, 7] + grid_z[1, 8]) / 2.0
+        # 左下 (4,0)
+        grid_z[4, 0] = (grid_z[3, 0] + grid_z[4, 1]) / 2.0
+        # 右下 (4,8)
+        grid_z[4, 8] = (grid_z[3, 8] + grid_z[4, 7]) / 2.0
+
         processed_matrices.append(grid_z)
 
-    final_output = np.array(processed_matrices)
-    print("处理完成。")
-    return final_output
+    return np.array(processed_matrices)
+
+
+# ==========================================
+# 2. 批量处理主程序
+# ==========================================
+def batch_process_folder(input_folder, output_file):
+    print(f"--- 开始处理文件夹: {input_folder} ---")
+
+    # 获取所有 .xlsx 和 .xls 文件
+    all_files = glob.glob(os.path.join(input_folder, "*.xlsx")) + \
+                glob.glob(os.path.join(input_folder, "*.xls"))
+
+    if not all_files:
+        print("未找到Excel文件！请检查路径。")
+        return
+
+    all_data_list = []
+    file_record = []  # 记录数据来源，方便后续追溯
+
+    for i, file_path in enumerate(all_files):
+        file_name = os.path.basename(file_path)
+        print(f"[{i + 1}/{len(all_files)}] 处理中: {file_name} ...", end="")
+
+        matrix_data = process_single_file(file_path)
+
+        if matrix_data is not None:
+            all_data_list.append(matrix_data)
+            # 记录这个文件包含了多少行数据
+            file_record.append({'filename': file_name, 'samples': matrix_data.shape[0]})
+            print(f" 完成 (样本数: {matrix_data.shape[0]})")
+        else:
+            print(" 跳过")
+
+    # 合并所有数据
+    if all_data_list:
+        # 使用 vstack 在第0维堆叠
+        final_dataset = np.vstack(all_data_list)
+
+        print(f"\n--- 处理完毕 ---")
+        print(f"总计文件数: {len(all_data_list)}")
+        print(f"总样本形状: {final_dataset.shape} (样本总数, 5, 9)")
+
+        # 保存为 .npy 文件
+        np.save(output_file, final_dataset)
+        print(f"数据已保存至: {output_file}")
+
+        # (可选) 保存一份文件记录到 csv，方便你知道哪几行属于哪个文件
+        record_df = pd.DataFrame(file_record)
+        record_df.to_csv(output_file.replace('.npy', '_log.csv'), index=False)
+        print(f"文件记录已保存至: {output_file.replace('.npy', '_log.csv')}")
+
+    else:
+        print("没有有效的数据被处理。")
 
 
 if __name__ == "__main__":
     # ================= 配置区域 =================
-    # 请在这里修改为你的真实文件名
-    excel_file = 'data.xlsx'
+
+    # 1. 设置包含Excel文件的文件夹路径 ('.' 代表当前目录)
+    my_input_folder = 'data/VFT/ADHD'
+
+    # 2. 设置输出文件名 (.npy格式)
+    my_output_file = 'data/VFT/ADHD_grid.npy'
+
     # ===========================================
 
-    result = process_sensor_data(excel_file)
-
-    if result is not None:
-        print(f"输出矩阵形状: {result.shape} (样本数, 5, 9)")
-
-        # 可选：保存为 numpy 文件，方便后续读取
-        # np.save('processed_data.npy', result)
-
-        # 可视化检查第一行数据（确保转换逻辑正确）
-        plt.imshow(result[0], cmap='jet', origin='upper')
-        plt.colorbar()
-        plt.title('Row 0: 5x9 Matrix Visualization')
-        plt.show()
+    # 确保文件夹存在
+    if not os.path.exists(my_input_folder):
+        print(f"错误：文件夹 '{my_input_folder}' 不存在，请创建并放入Excel文件。")
+    else:
+        batch_process_folder(my_input_folder, my_output_file)

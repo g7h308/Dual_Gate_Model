@@ -19,7 +19,7 @@ class CustomPatchEmbedding(nn.Module):
     - p6: (3, 3) at (2, 6)
     """
 
-    def __init__(self, in_channels: int = 3, embed_dim: int = 768):
+    def __init__(self, in_channels: int = 1, embed_dim: int = 768):
         super().__init__()
         self.embed_dim = embed_dim
 
@@ -78,10 +78,10 @@ if __name__ == '__main__':
     batch_size = 4  # 假设一个batch有4张图片
 
     # 实例化我们的定制嵌入层
-    custom_embed_layer = CustomPatchEmbedding(in_channels=3, embed_dim=embed_dim)
+    custom_embed_layer = CustomPatchEmbedding(in_channels=1, embed_dim=embed_dim)
 
     # 创建一个假的输入图片张量，尺寸必须是我们设计的 5x9
-    dummy_image = torch.randn(batch_size, 3, img_height, img_width)
+    dummy_image = torch.randn(batch_size, 1, img_height, img_width)
     print(f"输入图片形状: {dummy_image.shape}\n")
 
     # 将图片传入嵌入层
