@@ -9,7 +9,7 @@ class DualBranchRecurrentModel(nn.Module):
     def __init__(self,
                  embed_dim=128,
                  num_heads=4,
-                 depth=4,
+                 depth=3,
                  k_memory=3,
                  num_classes=2,
                  patch_nums=16):  # 假设 patch 数量固定，或者之后求平均
@@ -20,8 +20,8 @@ class DualBranchRecurrentModel(nn.Module):
         # --- Backbone 构建 ---
         # 包含若干层 TimeSformer Block 和 BIE
         # 这里的 depth 是指 (Timesformer + BIE) 重复的次数
-        self.hbo2_blocks = nn.ModuleList([TimeSformerBlock(embed_dim, num_heads) for _ in range(depth)])
-        self.hbr_blocks = nn.ModuleList([TimeSformerBlock(embed_dim, num_heads) for _ in range(depth)])
+        self.hbo2_blocks = nn.ModuleList([TimeSformerBlock(embed_dim, num_heads, 10, 6) for _ in range(depth)])
+        self.hbr_blocks = nn.ModuleList([TimeSformerBlock(embed_dim, num_heads, 10, 6) for _ in range(depth)])
         self.bie_layers = nn.ModuleList([BIE(embed_dim, num_heads) for _ in range(depth)])
 
         # --- Fusion Modules ---
@@ -41,12 +41,14 @@ class DualBranchRecurrentModel(nn.Module):
     def forward_one_step(self, hbo2_emb, hbr_emb):
         """
         处理单个时间步 t 的前向传播
-        hbo2_emb: [B, N, D] (已经做过 Patch Embedding)
-        hbr_emb:  [B, N, D]
+        hbo2_emb: [B, T, N, D] (已经做过 Patch Embedding)
+        hbr_emb:  [B, T, N, D]
         """
         x1 = hbo2_emb
         x2 = hbr_emb
-
+        B, T, N, D = x1.shape
+        x1 = x1.view(B,T*N,D)
+        x2 = x2.view(B,T*N,D)
         # 1. 经过多层 TimeSformer + BIE 提取特征
         for i in range(self.depth):
             # 各自经过 TimeSformer Block
@@ -81,16 +83,16 @@ class DualBranchRecurrentModel(nn.Module):
         final_hbr = None
 
         # --- The Loop (循环 n 次) ---
-        for t in range(time_steps):
+        for t in range(0, time_steps, 10):
             # 取出当前帧 t 的 patch embedding
-            input_t_hbo2 = hbo2_seq[:, t, :, :]
-            input_t_hbr = hbr_seq[:, t, :, :]
+            input_t_hbo2 = hbo2_seq[:, t:t+10, :, :]
+            input_t_hbr = hbr_seq[:, t:t+10, :, :]
 
             # 前向传播并更新记忆
             out_hbo2, out_hbr = self.forward_one_step(input_t_hbo2, input_t_hbr)
 
             # 如果是最后一次循环，保存结果用于分类
-            if t == time_steps - 1:
+            if t == time_steps - 10:
                 final_hbo2 = out_hbo2
                 final_hbr = out_hbr
 
@@ -115,7 +117,7 @@ class DualBranchRecurrentModel(nn.Module):
 # ==========================================
 if __name__ == "__main__":
     # 假设参数
-    B, T, N, D = 2, 10, 16, 64  # Batch=2, Time=10帧, Patches=16, Dim=64
+    B, T, N, D = 8, 1600, 6, 64  # Batch=2, Time=160帧, Patches=6, Dim=64
     k_memory = 3
     num_classes = 5
 

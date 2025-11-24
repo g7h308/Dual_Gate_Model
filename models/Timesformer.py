@@ -4,32 +4,108 @@ import torch.nn.functional as F
 from collections import deque
 
 
-class TimeSformerBlock(nn.Module):
-    """
-    标准的 Transformer Encoder Block 作为 TimeSformer 的基础单元。
-    这里简化使用标准的 Self-Attention，如果是 TimeSformer 的变体（如 Divided Space-Time），
-    可以在这里修改 Attention 的计算方式。
-    """
-
-    def __init__(self, dim, num_heads, mlp_ratio=4.0, dropout=0.1):
+class Mlp(nn.Module):
+    def __init__(self, in_features, hidden_features=None, act_layer=nn.GELU, drop=0.):
         super().__init__()
-        self.norm1 = nn.LayerNorm(dim)
-        self.attn = nn.MultiheadAttention(embed_dim=dim, num_heads=num_heads, batch_first=True, dropout=dropout)
-        self.norm2 = nn.LayerNorm(dim)
-        self.mlp = nn.Sequential(
-            nn.Linear(dim, int(dim * mlp_ratio)),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(int(dim * mlp_ratio), dim),
-            nn.Dropout(dropout)
-        )
+        hidden_features = hidden_features or in_features
+        self.fc1 = nn.Linear(in_features, hidden_features)
+        self.act = act_layer()
+        self.fc2 = nn.Linear(hidden_features, in_features)
+        self.drop = nn.Dropout(drop)
 
     def forward(self, x):
-        # x: [batch_size, patch_nums, embed_dim]
-        x_norm = self.norm1(x)
-        attn_out, _ = self.attn(x_norm, x_norm, x_norm)
-        x = x + attn_out
-        x = x + self.mlp(self.norm2(x))
+        x = self.fc1(x)
+        x = self.act(x)
+        x = self.drop(x)
+        x = self.fc2(x)
+        x = self.drop(x)
+        return x
+
+
+class TimeSformerBlock(nn.Module):
+    """
+    Divided Space-Time Attention Block
+    先做 Temporal Attention，再做 Spatial Attention
+    """
+
+    def __init__(self, dim, num_heads, num_frames, num_patches, mlp_ratio=4., qkv_bias=False, drop=0., attn_drop=0.):
+        super().__init__()
+        self.num_frames = num_frames
+        self.num_patches = num_patches
+
+        # --- Temporal Attention (时间) ---
+        self.norm1 = nn.LayerNorm(dim)
+        self.temporal_attn = nn.MultiheadAttention(dim, num_heads, dropout=attn_drop, batch_first=True)
+
+        # --- Spatial Attention (空间) ---
+        self.norm2 = nn.LayerNorm(dim)
+        self.spatial_attn = nn.MultiheadAttention(dim, num_heads, dropout=attn_drop, batch_first=True)
+
+        # --- MLP ---
+        self.norm3 = nn.LayerNorm(dim)
+        self.mlp = Mlp(in_features=dim, hidden_features=int(dim * mlp_ratio), drop=drop)
+
+    def forward(self, x):
+        # 输入 x: [B, T*N, D]
+        B, Total, D = x.shape
+        T = self.num_frames
+        N = self.num_patches
+
+        # === 1. Temporal Attention ===
+        # 目标: [B*N, T, D] (把每个空间位置独立出来，看它随时间的变化)
+
+        # 暂存残差
+        residual = x
+
+        x = self.norm1(x)
+
+        # Reshape: [B, T*N, D] -> [B, T, N, D]
+        x = x.view(B, T, N, D)
+        # Permute: [B, T, N, D] -> [B, N, T, D]
+        x = x.permute(0, 2, 1, 3)
+        # Reshape: [B, N, T, D] -> [B*N, T, D]
+        x = x.reshape(B * N, T, D)
+
+        # Self-Attention (sequence_len = T)
+        x, _ = self.temporal_attn(x, x, x)
+
+        # 还原形状
+        # [B*N, T, D] -> [B, N, T, D]
+        x = x.view(B, N, T, D)
+        # [B, N, T, D] -> [B, T, N, D]
+        x = x.permute(0, 2, 1, 3)
+        # [B, T, N, D] -> [B, T*N, D]
+        x = x.reshape(B, T * N, D)
+
+        # 残差连接
+        x = x + residual
+
+        # === 2. Spatial Attention ===
+        # 目标: [B*T, N, D] (把每一帧独立出来，看它内部patch的关系)
+
+        residual = x
+        x = self.norm2(x)
+
+        # Reshape: [B, T*N, D] -> [B, T, N, D]
+        x = x.view(B, T, N, D)
+        # Reshape: [B, T, N, D] -> [B*T, N, D]
+        x = x.reshape(B * T, N, D)
+
+        # Self-Attention (sequence_len = N)
+        x, _ = self.spatial_attn(x, x, x)
+
+        # 还原形状
+        # [B*T, N, D] -> [B, T, N, D]
+        x = x.view(B, T, N, D)
+        # [B, T, N, D] -> [B, T*N, D]
+        x = x.reshape(B, T * N, D)
+
+        # 残差连接
+        x = x + residual
+
+        # === 3. MLP ===
+        x = x + self.mlp(self.norm3(x))
+
         return x
 
 
