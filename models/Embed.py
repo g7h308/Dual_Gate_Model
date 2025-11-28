@@ -61,7 +61,7 @@ class VideoPatchEmbeddingWrapper(nn.Module):
         # 1. 【维度合并】 Merge Batch and Time
         # 将每一帧都视为独立的图片进行处理
         # [B, T, C, H, W] -> [B * T, C, H, W]
-        x_merged = x.view(B * T, C, H, W)
+        x_merged = x.reshape(B * T, C, H, W)
 
         # 2. 【空间嵌入】 Process with CustomPatchEmbedding
         # 输出形状: [B * T, Num_Patches, Embed_Dim]
@@ -80,12 +80,7 @@ class VideoPatchEmbeddingWrapper(nn.Module):
         # video_tokens: [B, T, N, D] + time_embed: [1, T, 1, D]
         video_tokens = video_tokens + self.time_embed
 
-        # 5. 【序列展平】 Flatten for Transformer
-        # TimeSformer 通常接受一个长序列，包含所有帧的所有 patch
-        # [B, T, N, D] -> [B, T * N, D]
-        output = video_tokens.flatten(1, 2)
-
-        return output
+        return video_tokens
 
 
 # --- 测试代码 ---
@@ -114,7 +109,7 @@ if __name__ == '__main__':
 
     # 4. 前向传播
     final_tokens = video_adapter(input_video)
-
+    print(final_tokens.shape)
     # 5. 验证输出
     # 预期 Token 总数 = Frames(8) * Patches(6) = 48
     expected_seq_len = FRAMES * base_embed.num_patches
