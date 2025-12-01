@@ -11,6 +11,9 @@ import random
 import datetime  # 新增
 import shutil  # 新增：用于删除文件夹
 import json  # 新增：用于美化打印参数
+
+from torch.nn.functional import dropout
+
 from models.DualBranchModel import DualBranchRecurrentModel
 from dataloader.VFTDataLoader import load_data
 
@@ -174,12 +177,15 @@ def get_args():
     parser.add_argument('--head', type=int, default=2)
     parser.add_argument('--depth', type=int, default=2)
     parser.add_argument('--k_memory', type=int, default=10)
+    parser.add_argument('--dropout',type=float,default=0.4)
+    parser.add_argument('--attn_drop',type=float,default=0.4)
     parser.add_argument('--epochs', type=int, default=100)
     parser.add_argument('--batch_size', type=int, default=16)
-    parser.add_argument('--lr', type=float, default=1e-4)
-    parser.add_argument('--weight_decay', type=float, default=1e-4)
-    parser.add_argument('--patience', type=int, default=20)
+    parser.add_argument('--lr', type=float, default=5e-5)
+    parser.add_argument('--weight_decay', type=float, default=1e-2)
+    parser.add_argument('--patience', type=int, default=10)
     parser.add_argument('--seed', type=int, default=0)
+    parser.add_argument('--optim_patience', type=int, default=5,help='每隔optim_patience轮lr减半')
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
     parser.add_argument('--save_dir', type=str, default='./checkpoints')
     parser.add_argument('--exp_name', type=str, default='dual_branch')
@@ -228,12 +234,14 @@ def main():
             num_heads=args.head,
             depth=args.depth,
             k_memory=args.k_memory,
-            num_classes=args.num_classes
+            num_classes=args.num_classes,
+            drop=args.dropout,
+            attn_drop=args.attn_drop
         ).to(device)
 
         criterion = nn.CrossEntropyLoss()
         optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=args.optim_patience)
 
         # EarlyStopping 保存路径设置在临时文件夹
         best_model_path = os.path.join(temp_save_path, 'best_model.pt')
