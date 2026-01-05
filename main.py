@@ -239,6 +239,8 @@ def get_args():
     parser.add_argument('--save_dir', type=str, default='./checkpoints')
     parser.add_argument('--exp_name', type=str, default='dual_branch')
     parser.add_argument('--k_folds', type=int, default=5)
+    parser.add_argument('--roi_mode',type=str, default='hemi_5_4',
+                        choices=('original', 'full', 'hemi_4_5', 'hemi_5_4'),help='original:6脑区，full：不划分  hemi_4_5:左脑4右脑5')
     return parser.parse_args()
 
 
@@ -311,7 +313,8 @@ def main():
                 k_memory=args.k_memory,
                 num_classes=args.num_classes,
                 drop=args.dropout,
-                attn_drop=args.attn_drop
+                attn_drop=args.attn_drop,
+                roi_mode=args.roi_mode
             ).to(device)
 
             criterion = nn.CrossEntropyLoss()

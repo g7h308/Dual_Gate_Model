@@ -14,7 +14,7 @@ class DualBranchRecurrentModel(nn.Module):
                  depth=3,
                  k_memory=20,
                  num_classes=2,
-                 chunk_size=10,drop=0.,attn_drop=0.):  # 新增 chunk_size，对应 TimeSformer 的时间窗口
+                 chunk_size=10,drop=0.,attn_drop=0.,roi_mode='original'):  # 新增 chunk_size，对应 TimeSformer 的时间窗口
         super().__init__()
 
         self.depth = depth
@@ -25,7 +25,8 @@ class DualBranchRecurrentModel(nn.Module):
         # 1. Embedding Layers (新增)
         # =========================================================
         # Branch 1: HbO2
-        self.patch_embed_hbo = CustomPatchEmbedding(in_channels=1, embed_dim=embed_dim)
+        self.patch_embed_hbo = CustomPatchEmbedding(in_channels=1, embed_dim=embed_dim, roi_mode=roi_mode)
+        num_patches = self.patch_embed_hbo.num_patches
         self.video_wrapper_hbo = VideoPatchEmbeddingWrapper(
             patch_embed_module=self.patch_embed_hbo,
             num_frames=chunk_size,  # 设为 10，因为我们在循环里每次切 10 帧
@@ -33,7 +34,7 @@ class DualBranchRecurrentModel(nn.Module):
         )
 
         # Branch 2: HbR (使用独立的权重，因为物理含义不同)
-        self.patch_embed_hbr = CustomPatchEmbedding(in_channels=1, embed_dim=embed_dim)
+        self.patch_embed_hbr = CustomPatchEmbedding(in_channels=1, embed_dim=embed_dim, roi_mode=roi_mode)
         self.video_wrapper_hbr = VideoPatchEmbeddingWrapper(
             patch_embed_module=self.patch_embed_hbr,
             num_frames=chunk_size,
@@ -45,10 +46,10 @@ class DualBranchRecurrentModel(nn.Module):
         # =========================================================
         # num_patches=6 是由 CustomPatchEmbedding 决定的
         self.hbo2_blocks = nn.ModuleList([
-            TimeSformerBlock(embed_dim, num_heads, chunk_size, 6,drop=drop,attn_drop=attn_drop) for _ in range(depth)
+            TimeSformerBlock(embed_dim, num_heads, chunk_size, num_patches,drop=drop,attn_drop=attn_drop) for _ in range(depth)
         ])
         self.hbr_blocks = nn.ModuleList([
-            TimeSformerBlock(embed_dim, num_heads, chunk_size, 6,drop=drop,attn_drop=attn_drop) for _ in range(depth)
+            TimeSformerBlock(embed_dim, num_heads, chunk_size, num_patches,drop=drop,attn_drop=attn_drop) for _ in range(depth)
         ])
         self.bie_layers = nn.ModuleList([
             BIE(embed_dim, num_heads) for _ in range(depth)

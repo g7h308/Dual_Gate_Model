@@ -3,17 +3,51 @@ import torch.nn as nn
 from typing import Tuple
 
 
-# 假设这是你之前定义的类（保持不变）
 class CustomPatchEmbedding(nn.Module):
-    def __init__(self, in_channels: int = 1, embed_dim: int = 768):
+    def __init__(self, in_channels: int = 1, embed_dim: int = 64, roi_mode: str = 'original'):
+        """
+        Args:
+            roi_mode:
+                'original': 原来的 6 个区域划分
+                'full': 全脑作为一个 Patch (5x9)
+                'hemi_4_5': 左脑 5x4, 右脑 5x5 (共 2 个 Patch)
+                'hemi_5_4': 左脑 5x5, 右脑 5x4 (共 2 个 Patch)
+        """
         super().__init__()
         self.embed_dim = embed_dim
-        # 定义每个patch的尺寸和在原图中的位置 [h, w, y_start, x_start]
-        self.patch_definitions = [
-            (2, 3, 0, 0), (1, 3, 0, 3), (2, 3, 0, 6),
-            (3, 3, 2, 0), (4, 3, 1, 3), (3, 3, 2, 6)
-        ]
+        self.roi_mode = roi_mode
+
+        # 定义 Patch 列表: (h, w, y_start, x_start)
+        if roi_mode == 'original':
+            # 原来的 6 个不规则区域
+            self.patch_definitions = [
+                (2, 3, 0, 0), (1, 3, 0, 3), (2, 3, 0, 6),
+                (3, 3, 2, 0), (4, 3, 1, 3), (3, 3, 2, 6)
+            ]
+        elif roi_mode == 'full':
+            # 策略一：只有一个脑区 (5x9)
+            # Spatial Attention 只会对自己计算attention score，只剩 Temporal Attention 起主要作用
+            self.patch_definitions = [
+                (5, 9, 0, 0)
+            ]
+        elif roi_mode == 'hemi_4_5':
+            # 策略二 (A)：左脑 5x4, 右脑 5x5
+            self.patch_definitions = [
+                (5, 4, 0, 0),  # Left: y=0~5, x=0~4
+                (5, 5, 0, 4)  # Right: y=0~5, x=4~9
+            ]
+        elif roi_mode == 'hemi_5_4':
+            # 策略二 (B)：左脑 5x5, 右脑 5x4
+            self.patch_definitions = [
+                (5, 5, 0, 0),  # Left: y=0~5, x=0~5
+                (5, 4, 0, 5)  # Right: y=0~5, x=5~9
+            ]
+        else:
+            raise ValueError(f"Unknown roi_mode: {roi_mode}")
+
         self.num_patches = len(self.patch_definitions)
+
+        # 构建卷积投影层
         self.patch_projs = nn.ModuleList()
         for h, w, _, _ in self.patch_definitions:
             self.patch_projs.append(nn.Conv2d(in_channels, embed_dim, kernel_size=(h, w)))
@@ -21,10 +55,16 @@ class CustomPatchEmbedding(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         patch_embeddings = []
         for i, (h, w, y_start, x_start) in enumerate(self.patch_definitions):
+            # 切片
             image_patch = x[..., y_start: y_start + h, x_start: x_start + w]
+            # 卷积映射
             patch_proj_output = self.patch_projs[i](image_patch)
+            # 展平: [B, D, 1, 1] -> [B, D] -> [B, 1, D]
+            # 注意: 如果 patch size 和 kernel size 一样大，输出就是 1x1
             flattened_patch = patch_proj_output.flatten(2).transpose(1, 2)
             patch_embeddings.append(flattened_patch)
+
+        # 拼接所有 patch: [B, num_patches, D]
         return torch.cat(patch_embeddings, dim=1)
 
 
