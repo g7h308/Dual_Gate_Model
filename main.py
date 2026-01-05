@@ -11,11 +11,14 @@ import random
 import datetime  # 新增
 import shutil  # 新增：用于删除文件夹
 import json  # 新增：用于美化打印参数
-
+import matplotlib.pyplot as plt
 from torch.nn.functional import dropout
+from torch.utils.data import DataLoader
+from sklearn.model_selection import KFold
 
 from models.DualBranchModel import DualBranchRecurrentModel
-from dataloader.VFTDataLoader import load_data
+# 引入新的加载函数
+from dataloader.VFTDataLoader import load_raw_data, augment_data_odd_even, DualModalityDataset
 
 
 # ==========================================
@@ -83,40 +86,86 @@ def log_hyperparameters(logger, args):
     logger.info("=" * 30)
 
 
+def plot_loss_curve(train_losses, val_losses, save_path, fold_idx):
+    plt.figure(figsize=(10, 6))
+    plt.plot(train_losses, label='Train Loss', color='blue')
+    plt.plot(val_losses, label='Val Loss', color='red', linestyle='--')
+    plt.title(f'Fold {fold_idx} Loss')
+    plt.xlabel('Epochs')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.grid(True)
+    plt.savefig(os.path.join(save_path, f'loss_curve_fold_{fold_idx}.png'))
+    plt.close()
+
 
 # ==========================================
 # 3. 早停
 # ==========================================
 class EarlyStopping:
-    def __init__(self, patience=10, delta=0, verbose=False, path='checkpoint.pt'):
+    def __init__(self, patience=10, verbose=False, path='checkpoint.pt'):
+        """
+        Args:
+            patience (int): 多少个 epoch 没有提升（Acc没变大 且 Loss没变小）就停止
+            verbose (bool): 是否打印日志
+            path (str): 模型保存路径
+        """
         self.patience = patience
         self.verbose = verbose
-        self.counter = 0
-        self.best_score = None
-        self.early_stop = False
-        self.val_loss_min = np.Inf
-        self.delta = delta
         self.path = path
+        self.counter = 0
+        self.early_stop = False
 
-    def __call__(self, val_loss, model, logger):
-        score = -val_loss
-        if self.best_score is None:
-            self.best_score = score
-            self.save_checkpoint(val_loss, model, logger)
-        elif score < self.best_score + self.delta:
-            self.counter += 1
-            if self.counter >= self.patience:
-                self.early_stop = True
+        # 记录最佳指标
+        self.best_acc = -np.Inf
+        self.best_loss = np.Inf
+
+    def __call__(self, val_acc, val_loss, model, logger):
+        """
+        逻辑：
+        1. 如果当前 Acc > 历史最佳 Acc：保存模型 (更新最佳 Acc 和 Loss)
+        2. 如果当前 Acc == 历史最佳 Acc：
+             如果当前 Loss < 历史最佳 Loss：保存模型 (更新最佳 Loss)
+             否则：计数器 +1
+        3. 如果当前 Acc < 历史最佳 Acc：计数器 +1
+        """
+
+        # 情况 1: 准确率创新高
+        if val_acc > self.best_acc:
+            if self.verbose:
+                logger.info(f'Validation Acc increased ({self.best_acc:.4f} --> {val_acc:.4f}). Saving model...')
+            self.best_acc = val_acc
+            self.best_loss = val_loss  # 同时更新对应的 loss
+            self.save_checkpoint(model)
+            self.counter = 0  # 重置计数器
+
+        # 情况 2: 准确率持平，看 Loss 是否降低
+        elif val_acc == self.best_acc:
+            if val_loss < self.best_loss:
+                if self.verbose:
+                    logger.info(
+                        f'Acc same ({self.best_acc:.4f}), but Loss decreased ({self.best_loss:.4f} --> {val_loss:.4f}). Saving model...')
+                self.best_loss = val_loss
+                self.save_checkpoint(model)
+                self.counter = 0  # 重置计数器
+            else:
+                self.counter += 1
+                if self.verbose:
+                    logger.info(
+                        f'EarlyStopping counter: {self.counter} out of {self.patience} (Acc same, Loss not improved)')
+
+        # 情况 3: 准确率下降
         else:
-            self.best_score = score
-            self.save_checkpoint(val_loss, model, logger)
-            self.counter = 0
+            self.counter += 1
+            if self.verbose:
+                logger.info(f'EarlyStopping counter: {self.counter} out of {self.patience} (Acc decreased)')
 
-    def save_checkpoint(self, val_loss, model, logger):
-        if self.verbose:
-            logger.info(f'Validation loss decreased ({self.val_loss_min:.6f} --> {val_loss:.6f}). Saving model...')
+        # 检查是否触发早停
+        if self.counter >= self.patience:
+            self.early_stop = True
+
+    def save_checkpoint(self, model):
         torch.save(model.state_dict(), self.path)
-        self.val_loss_min = val_loss
 
 
 # ==========================================
@@ -189,6 +238,7 @@ def get_args():
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
     parser.add_argument('--save_dir', type=str, default='./checkpoints')
     parser.add_argument('--exp_name', type=str, default='dual_branch')
+    parser.add_argument('--k_folds', type=int, default=5)
     return parser.parse_args()
 
 
@@ -196,115 +246,135 @@ def main():
     args = get_args()
     set_seed(args.seed)
 
-    # --- 1. 动态生成文件夹名称 (时间戳) ---
     current_time = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
-
-    # 临时文件夹：程序运行时数据存这里
-    temp_folder_name = f"temp_{args.exp_name}_{current_time}"
+    temp_folder_name = f"temp_{args.exp_name}_{current_time}_kfold"
     temp_save_path = os.path.join(args.save_dir, temp_folder_name)
-
-    # 最终文件夹：程序成功结束后，重命名为此
-    final_folder_name = f"{args.exp_name}_{current_time}"
+    final_folder_name = f"{args.exp_name}_{current_time}_kfold"
     final_save_path = os.path.join(args.save_dir, final_folder_name)
 
-    # 创建临时文件夹
     os.makedirs(temp_save_path, exist_ok=True)
+    logger = get_logger(os.path.join(temp_save_path, 'train.log'))
 
-    # --- 2. 初始化 Logger ---
-    # Log 存放在临时文件夹中
-    log_file_path = os.path.join(temp_save_path, 'train.log')
-    logger = get_logger(log_file_path)
-
-    # 使用 try...except...finally 块来管理文件夹的去留
     try:
-        logger.info(f"Start Training... Temp saving to: {temp_save_path}")
-
-        # --- 3. 记录超参数 ---
-        # 这是一个新加入的功能，自动把 args 写入日志
+        logger.info(f"Start {args.k_folds}-Fold Cross Validation (Strict Subject Separation)")
         log_hyperparameters(logger, args)
 
-        # 加载数据
-        train_loader, val_loader, test_loader = load_data(args)
-        logger.info(f"Train batches: {len(train_loader)}, Val batches: {len(val_loader)}")
+        # 1. 加载原始数据 (未扩充)
+        # Shape: (N_subjects, T, C, H, W)
+        X_oxy_all, X_dxy_all, y_all = load_raw_data(args)
 
-        # 初始化模型
+        logger.info(f"Loaded raw data. Total subjects: {len(y_all)}")
+
+        # 2. 定义 K-Fold (基于 Subject ID 进行划分)
+        kfold = KFold(n_splits=args.k_folds, shuffle=True, random_state=args.seed)
+
+        fold_results = []
         device = torch.device(args.device)
-        model = DualBranchRecurrentModel(
-            embed_dim=args.hidden_dims,
-            num_heads=args.head,
-            depth=args.depth,
-            k_memory=args.k_memory,
-            num_classes=args.num_classes,
-            drop=args.dropout,
-            attn_drop=args.attn_drop
-        ).to(device)
 
-        criterion = nn.CrossEntropyLoss()
-        optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=args.optim_patience)
+        # 3. K-Fold 循环
+        # split 的输入是 range(N_subjects)，保证同一个人的数据要么都在训练，要么都在验证
+        for fold, (train_idx, val_idx) in enumerate(kfold.split(X_oxy_all)):
+            logger.info(f"\n{'=' * 20} Fold [{fold + 1}/{args.k_folds}] {'=' * 20}")
+            logger.info(f"Train subjects: {len(train_idx)}, Val subjects: {len(val_idx)}")
 
-        # EarlyStopping 保存路径设置在临时文件夹
-        best_model_path = os.path.join(temp_save_path, 'best_model.pt')
-        early_stopping = EarlyStopping(patience=args.patience, verbose=True, path=best_model_path)
+            # --- 关键步骤：先根据索引切分 ---
+            X_train_oxy_raw = X_oxy_all[train_idx]
+            X_train_dxy_raw = X_dxy_all[train_idx]
+            y_train_raw = y_all[train_idx]
 
-        start_time = time.time()
+            X_val_oxy_raw = X_oxy_all[val_idx]
+            X_val_dxy_raw = X_dxy_all[val_idx]
+            y_val_raw = y_all[val_idx]
 
-        # --- 训练循环 ---
-        for epoch in range(args.epochs):
-            train_loss, train_acc = train_one_epoch(model, train_loader, criterion, optimizer, device)
-            val_loss, val_acc = evaluate(model, val_loader, criterion, device)
+            # --- 关键步骤：然后在各自集合内独立进行扩充 ---
+            # 这样 Train 里的扩充样本只来自 Train Subject，Val 同理
+            train_oxy_aug, train_dxy_aug, train_y_aug = augment_data_odd_even(X_train_oxy_raw, X_train_dxy_raw,
+                                                                              y_train_raw)
+            val_oxy_aug, val_dxy_aug, val_y_aug = augment_data_odd_even(X_val_oxy_raw, X_val_dxy_raw, y_val_raw)
 
-            scheduler.step(val_loss)
+            logger.info(f"Augmented Train Samples: {len(train_y_aug)} | Augmented Val Samples: {len(val_y_aug)}")
 
-            logger.info(f"Epoch [{epoch + 1}/{args.epochs}] "
-                        f"Train Loss: {train_loss:.4f} Acc: {train_acc:.4f} | "
-                        f"Val Loss: {val_loss:.4f} Acc: {val_acc:.4f} | "
-                        f"LR: {optimizer.param_groups[0]['lr']:.6f}")
+            # --- 构建 Dataset 和 DataLoader ---
+            train_dataset = DualModalityDataset(train_oxy_aug, train_dxy_aug, train_y_aug)
+            val_dataset = DualModalityDataset(val_oxy_aug, val_dxy_aug, val_y_aug)
 
-            early_stopping(val_loss, model, logger)
-            if early_stopping.early_stop:
-                logger.info("Early stopping triggered.")
-                break
+            train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True,
+                                      num_workers=args.num_workers)
+            val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False,
+                                    num_workers=args.num_workers)
 
-        logger.info(f"Training finished in {time.time() - start_time:.2f}s")
+            # --- 模型初始化 (每折重置) ---
+            model = DualBranchRecurrentModel(
+                embed_dim=args.hidden_dims,
+                num_heads=args.head,
+                depth=args.depth,
+                k_memory=args.k_memory,
+                num_classes=args.num_classes,
+                drop=args.dropout,
+                attn_drop=args.attn_drop
+            ).to(device)
 
-        # --- 测试 ---
-        if os.path.exists(best_model_path):
-            model.load_state_dict(torch.load(best_model_path))
-            test_loss, test_acc = evaluate(model, test_loader, criterion, device)
-            logger.info(f"Test Result -> Loss: {test_loss:.4f}, Acc: {test_acc:.4f}")
-        else:
-            logger.warning("No best model saved!")
+            criterion = nn.CrossEntropyLoss()
+            optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+            scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5,
+                                                             patience=args.optim_patience)
 
-        # --- 标记成功 ---
-        # 程序运行到这里没有报错，说明是正常结束
-        logger.info("Process finished successfully.")
+            best_model_path = os.path.join(temp_save_path, f'best_model_fold_{fold}.pt')
+            early_stopping = EarlyStopping(patience=args.patience, verbose=False, path=best_model_path)
 
-        # 必须先关闭logger，否则Windows下无法重命名文件夹（文件被占用）
+            train_losses = []
+            val_losses = []
+
+            # --- 训练 ---
+            for epoch in range(args.epochs):
+                train_loss, train_acc = train_one_epoch(model, train_loader, criterion, optimizer, device)
+                val_loss, val_acc = evaluate(model, val_loader, criterion, device)
+
+                train_losses.append(train_loss)
+                val_losses.append(val_loss)
+
+                if (epoch + 1) % 5 == 0 or epoch == 0:
+                    logger.info(f"Fold {fold + 1} Epoch [{epoch + 1}/{args.epochs}] "
+                                f"T_Loss: {train_loss:.4f} T_Acc: {train_acc:.4f} | "
+                                f"V_Loss: {val_loss:.4f} V_Acc: {val_acc:.4f}")
+
+                early_stopping(val_acc=val_acc, val_loss=val_loss, model=model, logger=logger)
+
+                if early_stopping.early_stop:
+                    logger.info(f"Fold {fold + 1} Early stopping triggered.")
+                    break
+
+            plot_loss_curve(train_losses, val_losses, temp_save_path, fold)
+
+            # --- 验证 ---
+            if os.path.exists(best_model_path):
+                model.load_state_dict(torch.load(best_model_path))
+                final_loss, final_acc = evaluate(model, val_loader, criterion, device)
+                logger.info(
+                    f"Fold {fold + 1} BEST Model (High Acc, Low Loss) -> Loss: {final_loss:.4f}, Acc: {final_acc:.4f}")
+                fold_results.append(final_acc)
+            else:
+                fold_results.append(0.0)
+
+        # --- 总结 ---
+        avg_acc = np.mean(fold_results)
+        std_acc = np.std(fold_results)
+        logger.info("\n" + "=" * 30)
+        logger.info(f"Final 5-Fold CV Results:")
+        for i, acc in enumerate(fold_results):
+            logger.info(f"Fold {i + 1}: {acc:.4f}")
+        logger.info(f"Average Accuracy: {avg_acc:.4f} ± {std_acc:.4f}")
+        logger.info("=" * 30)
+
         close_logger(logger)
-
-        # 将临时文件夹重命名为正式文件夹
         if os.path.exists(temp_save_path):
             os.rename(temp_save_path, final_save_path)
-            print(f"Results saved to: {final_save_path}")
-
-    except KeyboardInterrupt:
-        # 用户手动中断 (Ctrl+C)
-        close_logger(logger)
-        print("\nProcess Interrupted by user. Cleaning up temp files...")
-        if os.path.exists(temp_save_path):
-            shutil.rmtree(temp_save_path)  # 递归删除文件夹
-        print("Cleanup done. Nothing saved.")
-        sys.exit(0)
+            print(f"Saved to: {final_save_path}")
 
     except Exception as e:
-        # 程序发生其他错误
         close_logger(logger)
-        print(f"\nAn error occurred: {e}")
-        print("Cleaning up temp files due to error...")
-        if os.path.exists(temp_save_path):
-            shutil.rmtree(temp_save_path)
-        print("Cleanup done. Nothing saved.")
+        import traceback
+        traceback.print_exc()
         sys.exit(1)
 
 
