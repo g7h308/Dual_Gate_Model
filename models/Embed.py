@@ -42,6 +42,13 @@ class CustomPatchEmbedding(nn.Module):
                 (5, 5, 0, 0),  # Left: y=0~5, x=0~5
                 (5, 4, 0, 5)  # Right: y=0~5, x=5~9
             ]
+        elif roi_mode == 'three_columns':
+            # 策略四：横向三等分，覆盖全高 (5x3)
+            self.patch_definitions = [
+                (5, 3, 0, 0),  # Left:   h=5, w=3, y=0, x=0~3
+                (5, 3, 0, 3),  # Middle: h=5, w=3, y=0, x=3~6
+                (5, 3, 0, 6)  # Right:  h=5, w=3, y=0, x=6~9
+            ]
         else:
             raise ValueError(f"Unknown roi_mode: {roi_mode}")
 

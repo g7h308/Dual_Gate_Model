@@ -64,6 +64,59 @@ def process_single_sheet(file_path, sheet_name):
     return np.array(processed_matrices)
 
 
+def process_single_sheet_zero(file_path, sheet_name):
+    """
+    处理单个 Excel 文件的指定 Sheet
+    修改：不进行插值，空白处直接填 0
+    """
+    try:
+        df = pd.read_excel(file_path, sheet_name=sheet_name, header=None)
+    except Exception as e:
+        print(f"    - [读取失败] Sheet: {sheet_name} - {e}")
+        return None
+
+    data = df.values
+    # 检查列数
+    if data.shape[1] < 22:
+        print(f"    - [跳过] 列数不足: {sheet_name}")
+        return None
+
+    sensor_data = data[:, :22]
+
+    # 标准化 (依然保留，保证数据量级统一)
+    scaler = StandardScaler()
+    data_norm = scaler.fit_transform(sensor_data)
+
+    # 坐标映射 (保持不变)
+    coords_map = {
+        0: (0, 1), 1: (0, 3), 2: (0, 5), 3: (0, 7),
+        4: (1, 0), 5: (1, 2), 6: (1, 4), 7: (1, 6), 8: (1, 8),
+        9: (2, 1), 10: (2, 3), 11: (2, 5), 12: (2, 7),
+        13: (3, 0), 14: (3, 2), 15: (3, 4), 16: (3, 6), 17: (3, 8),
+        18: (4, 1), 19: (4, 3), 20: (4, 5), 21: (4, 7)
+    }
+
+    processed_matrices = []
+
+    # ------------------ 修改开始 ------------------
+    for row_values in data_norm:
+        # 1. 创建一个 5x9 的全 0 矩阵
+        grid_z = np.zeros((5, 9))
+
+        # 2. 将 22 个传感器的数据填入对应位置
+        for i in range(22):
+            if i in coords_map:
+                r, c = coords_map[i]
+                grid_z[r, c] = row_values[i]
+
+        # (已删除插值、NaN处理和角落修正代码)
+
+        processed_matrices.append(grid_z)
+    # ------------------ 修改结束 ------------------
+
+    return np.array(processed_matrices)
+
+
 # ==========================================
 # 2. 辅助函数：对齐与保存
 # ==========================================
@@ -125,8 +178,8 @@ def batch_process_folder_dual(input_folder, output_base_name, fixed_length=None)
         print(f"[{i + 1}/{len(all_files)}] 读取: {file_name}")
 
         # 分别处理两个 sheet
-        oxy_data = process_single_sheet(file_path, 'oxyData')
-        dxy_data = process_single_sheet(file_path, 'dxyData')
+        oxy_data = process_single_sheet_zero(file_path, 'oxyData')
+        dxy_data = process_single_sheet_zero(file_path, 'dxyData')
 
         # 只有当两个 sheet 都成功读取时，才保留该样本
         if oxy_data is not None and dxy_data is not None:
@@ -161,8 +214,8 @@ def batch_process_folder_dual(input_folder, output_base_name, fixed_length=None)
     # 如果 output_base_name 是 "data/VFT/HC_grid.npy"，去掉扩展名再加后缀
     base, _ = os.path.splitext(output_base_name)
 
-    out_oxy = f"{base}_oxy.npy"
-    out_dxy = f"{base}_dxy.npy"
+    out_oxy = f"{base}_oxy_zero.npy"
+    out_dxy = f"{base}_dxy_zero.npy"
 
     align_and_save(oxy_list, out_oxy, target_len, "OxyData")
     align_and_save(dxy_list, out_dxy, target_len, "DxyData")
@@ -171,9 +224,9 @@ def batch_process_folder_dual(input_folder, output_base_name, fixed_length=None)
 
 
 if __name__ == "__main__":
-    my_input_folder = 'data/VFT/ADHD_xlsx'
+    my_input_folder = 'data/VFT/HC_xlsx'
     # 这里只写基础文件名，程序会自动生成 HC_grid_oxy.npy 和 HC_grid_dxy.npy
-    my_output_base = 'data/VFT/ADHD_grid.npy'
+    my_output_base = 'data/VFT/HC_grid.npy'
 
     if os.path.exists(my_input_folder):
         batch_process_folder_dual(my_input_folder, my_output_base, fixed_length=None)
