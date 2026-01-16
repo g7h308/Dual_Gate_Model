@@ -35,7 +35,6 @@ def set_seed(seed):
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
 
-
 def get_logger(save_path):
     """
     初始化日志
@@ -43,7 +42,7 @@ def get_logger(save_path):
     logger = logging.getLogger()
     logger.setLevel(logging.INFO)
 
-    # 清除之前的 handlers，防止多次调用导致重复打印
+    # 清除之前的 handlers
     if logger.hasHandlers():
         logger.handlers.clear()
 
@@ -56,12 +55,14 @@ def get_logger(save_path):
 
     # 文件输出
     if save_path:
-        fh = logging.FileHandler(save_path, mode='w')  # mode='w' 确保新建
+        # ============ 修改开始 ============
+        # 添加 encoding='utf-8' 参数
+        fh = logging.FileHandler(save_path, mode='w', encoding='utf-8')
+        # ============ 修改结束 ============
         fh.setFormatter(formatter)
         logger.addHandler(fh)
 
     return logger
-
 
 def close_logger(logger):
     """

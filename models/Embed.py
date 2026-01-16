@@ -60,11 +60,14 @@ class CustomPatchEmbedding(nn.Module):
             self.patch_projs.append(nn.Conv2d(in_channels, embed_dim, kernel_size=(h, w)))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        #x: [B * T, C, H, W]
         patch_embeddings = []
         for i, (h, w, y_start, x_start) in enumerate(self.patch_definitions):
             # 切片
+            #image-patch:[B * T, C, H, W] -> [B * T, C, h, w]
             image_patch = x[..., y_start: y_start + h, x_start: x_start + w]
             # 卷积映射
+            #[B * T, C, h, w] -> [B * T, D, 1, 1]
             patch_proj_output = self.patch_projs[i](image_patch)
             # 展平: [B, D, 1, 1] -> [B, D] -> [B, 1, D]
             # 注意: 如果 patch size 和 kernel size 一样大，输出就是 1x1
@@ -101,6 +104,7 @@ class VideoPatchEmbeddingWrapper(nn.Module):
     def forward(self, x):
         """
         输入 x: [Batch_Size, T, C, H, W]
+        注意这里的C通道指的是RGB通道，fnirs数据当然C永远是1
         输出 out: [Batch_Size, T * N, Embed_Dim]
         """
         B, T, C, H, W = x.shape
