@@ -20,7 +20,8 @@ from models.DualBranchModel import DualBranchRecurrentModel
 # 引入新的加载函数
 from dataloader.VFTDataLoader import load_raw_data, augment_data_odd_even, DualModalityDataset
 
-
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
+from torch.nn.functional import dropout, softmax # 引入 softmax 计算概率
 # ==========================================
 # 1. 工具函数
 # ==========================================
@@ -169,15 +170,37 @@ class EarlyStopping:
         torch.save(model.state_dict(), self.path)
 
 
+def calculate_metrics(all_labels, all_preds, all_probs):
+    """
+    计算五个指标
+    """
+    acc = accuracy_score(all_labels, all_preds)
+    precision = precision_score(all_labels, all_preds, zero_division=0)
+    recall = recall_score(all_labels, all_preds, zero_division=0)
+    f1 = f1_score(all_labels, all_preds, zero_division=0)
+    try:
+        # 假设是二分类，取正类的概率
+        auc = roc_auc_score(all_labels, all_probs[:, 1])
+    except:
+        auc = 0.5  # 防止只有一个类别的异常情况
+
+    return {
+        "acc": acc,
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+        "auc": auc
+    }
+
 # ==========================================
 # 4. 训练与评估
 # ==========================================
-
 def train_one_epoch(model, loader, criterion, optimizer, device):
     model.train()
     running_loss = 0.0
-    correct = 0
-    total = 0
+    all_labels = []
+    all_preds = []
+    all_probs = []
 
     for oxy, dxy, labels in loader:
         oxy, dxy, labels = oxy.to(device), dxy.to(device), labels.to(device)
@@ -188,18 +211,23 @@ def train_one_epoch(model, loader, criterion, optimizer, device):
         optimizer.step()
 
         running_loss += loss.item() * labels.size(0)
+        probs = softmax(outputs, dim=1)
         _, predicted = outputs.max(1)
-        total += labels.size(0)
-        correct += predicted.eq(labels).sum().item()
 
-    return running_loss / total, correct / total
+        all_labels.extend(labels.cpu().numpy())
+        all_preds.extend(predicted.cpu().numpy())
+        all_probs.extend(probs.detach().cpu().numpy())
+
+    metrics = calculate_metrics(np.array(all_labels), np.array(all_preds), np.array(all_probs))
+    return running_loss / len(loader.dataset), metrics
 
 
 def evaluate(model, loader, criterion, device):
     model.eval()
     running_loss = 0.0
-    correct = 0
-    total = 0
+    all_labels = []
+    all_preds = []
+    all_probs = []
 
     with torch.no_grad():
         for oxy, dxy, labels in loader:
@@ -207,12 +235,16 @@ def evaluate(model, loader, criterion, device):
             outputs = model(oxy, dxy)
             loss = criterion(outputs, labels)
             running_loss += loss.item() * labels.size(0)
+
+            probs = softmax(outputs, dim=1)
             _, predicted = outputs.max(1)
-            total += labels.size(0)
-            correct += predicted.eq(labels).sum().item()
 
-    return running_loss / total, correct / total
+            all_labels.extend(labels.cpu().numpy())
+            all_preds.extend(predicted.cpu().numpy())
+            all_probs.extend(probs.cpu().numpy())
 
+    metrics = calculate_metrics(np.array(all_labels), np.array(all_preds), np.array(all_probs))
+    return running_loss / len(loader.dataset), metrics
 
 # ==========================================
 # 5. 主函数 (核心修改部分)
@@ -251,9 +283,9 @@ def main():
     set_seed(args.seed)
 
     current_time = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
-    temp_folder_name = f"temp_{args.exp_name}_{current_time}_kfold"
+    temp_folder_name = f"temp_{args.exp_name}_{current_time}_kfold_5metrics"
     temp_save_path = os.path.join(args.save_dir, temp_folder_name)
-    final_folder_name = f"{args.exp_name}_{current_time}_kfold"
+    final_folder_name = f"{args.exp_name}_{current_time}_kfold_metrics"
     final_save_path = os.path.join(args.save_dir, final_folder_name)
 
     os.makedirs(temp_save_path, exist_ok=True)
@@ -272,7 +304,7 @@ def main():
         # 2. 定义 K-Fold (基于 Subject ID 进行划分)
         kfold = KFold(n_splits=args.k_folds, shuffle=True, random_state=args.seed)
 
-        fold_results = []
+        fold_final_metrics = []
         device = torch.device(args.device)
 
         # 3. K-Fold 循环
@@ -332,21 +364,20 @@ def main():
 
             # --- 训练 ---
             for epoch in range(args.epochs):
-                train_loss, train_acc = train_one_epoch(model, train_loader, criterion, optimizer, device)
-                val_loss, val_acc = evaluate(model, val_loader, criterion, device)
+                train_loss, t_m = train_one_epoch(model, train_loader, criterion, optimizer, device)
+                val_loss, v_m = evaluate(model, val_loader, criterion, device)
 
                 train_losses.append(train_loss)
                 val_losses.append(val_loss)
 
                 if (epoch + 1) % 5 == 0 or epoch == 0:
                     logger.info(f"Fold {fold + 1} Epoch [{epoch + 1}/{args.epochs}] "
-                                f"T_Loss: {train_loss:.4f} T_Acc: {train_acc:.4f} | "
-                                f"V_Loss: {val_loss:.4f} V_Acc: {val_acc:.4f}")
+                                f"T_Loss: {train_loss:.4f} | T_Acc: {t_m['acc']:.4f} T_Pre: {t_m['precision']:.4f} T_Rec: {t_m['recall']:.4f} T_F1: {t_m['f1']:.4f} T_AUC: {t_m['auc']:.4f}")
+                    logger.info(
+                        f"V_Loss: {val_loss:.4f} | V_Acc: {v_m['acc']:.4f} V_Pre: {v_m['precision']:.4f} V_Rec: {v_m['recall']:.4f} V_F1: {v_m['f1']:.4f} V_AUC: {v_m['auc']:.4f}")
 
-                early_stopping(val_acc=val_acc, val_loss=val_loss, model=model, logger=logger)
-
+                early_stopping(val_acc=v_m['acc'], val_loss=val_loss, model=model, logger=logger)
                 if early_stopping.early_stop:
-                    logger.info(f"Fold {fold + 1} Early stopping triggered.")
                     break
 
             plot_loss_curve(train_losses, val_losses, temp_save_path, fold)
@@ -354,21 +385,19 @@ def main():
             # --- 验证 ---
             if os.path.exists(best_model_path):
                 model.load_state_dict(torch.load(best_model_path))
-                final_loss, final_acc = evaluate(model, val_loader, criterion, device)
+                f_loss, f_m = evaluate(model, val_loader, criterion, device)
                 logger.info(
-                    f"Fold {fold + 1} BEST Model (High Acc, Low Loss) -> Loss: {final_loss:.4f}, Acc: {final_acc:.4f}")
-                fold_results.append(final_acc)
+                    f"Fold {fold + 1} BEST Result -> Acc: {f_m['acc']:.4f}, Pre: {f_m['precision']:.4f}, Rec: {f_m['recall']:.4f}, F1: {f_m['f1']:.4f}, AUC: {f_m['auc']:.4f}")
+                fold_final_metrics.append(f_m)
             else:
-                fold_results.append(0.0)
+                fold_final_metrics.append({"acc": 0, "precision": 0, "recall": 0, "f1": 0, "auc": 0})
 
         # --- 总结 ---
-        avg_acc = np.mean(fold_results)
-        std_acc = np.std(fold_results)
         logger.info("\n" + "=" * 30)
-        logger.info(f"Final 5-Fold CV Results:")
-        for i, acc in enumerate(fold_results):
-            logger.info(f"Fold {i + 1}: {acc:.4f}")
-        logger.info(f"Average Accuracy: {avg_acc:.4f} ± {std_acc:.4f}")
+        logger.info(f"Final {args.k_folds}-Fold CV Summary:")
+        for m_name in ["acc", "precision", "recall", "f1", "auc"]:
+            vals = [f[m_name] for f in fold_final_metrics]
+            logger.info(f"{m_name.upper()}: {np.mean(vals):.4f} ± {np.std(vals):.4f}")
         logger.info("=" * 30)
 
         close_logger(logger)

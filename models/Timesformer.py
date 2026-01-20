@@ -178,3 +178,32 @@ class BIE(nn.Module):
         out2 = self.gate_2(x2, attn_out_2)
 
         return out1, out2
+
+
+
+class BIE_Concat(nn.Module):
+    def __init__(self, dim, num_heads, dropout=0.1):
+        super().__init__()
+        # 1. 只需要一个 Linear 层，把拼接后的 [2D] 降维回 [D]
+        self.fusion = nn.Linear(dim * 2, dim)
+
+        # 保持其他组件不动
+        self.gate_1 = GatedFusion(dim)
+        self.gate_2 = GatedFusion(dim)
+        self.norm1 = nn.LayerNorm(dim)
+        self.norm2 = nn.LayerNorm(dim)
+
+    def forward(self, x1, x2):
+        x1_norm = self.norm1(x1)
+        x2_norm = self.norm2(x2)
+
+        # 2. 直接 Concat，然后降维
+        # cat: [B, N, D] + [B, N, D] -> [B, N, 2D]
+        # fusion: [B, N, 2D] -> [B, N, D]
+        merged = self.fusion(torch.cat([x1_norm, x2_norm], dim=-1))
+
+        # 3. 把融合后的特征(merged)分别喂给两边的门控
+        out1 = self.gate_1(x1, merged)
+        out2 = self.gate_2(x2, merged)
+
+        return out1, out2
