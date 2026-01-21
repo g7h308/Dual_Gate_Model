@@ -207,3 +207,83 @@ class BIE_Concat(nn.Module):
         out2 = self.gate_2(x2, merged)
 
         return out1, out2
+
+
+# 添加到 models/Timesformer.py 文件的末尾或 TimeSformerBlock 附近
+
+class ConvBlock(nn.Module):
+    """
+    用于消融实验的卷积块，完全替代 TimeSformerBlock。
+    使用 1D 卷积分别在 '时间' 和 '空间' 维度上进行特征提取。
+    接口参数保持一致，以便无缝替换。
+    """
+
+    def __init__(self, dim, num_heads, num_frames, num_patches, mlp_ratio=4., qkv_bias=False, drop=0., attn_drop=0.):
+        super().__init__()
+        self.num_frames = num_frames
+        self.num_patches = num_patches
+
+        # --- Temporal Convolution (替代 Temporal Attention) ---
+        self.norm1 = nn.LayerNorm(dim)
+        # kernel_size=3, padding=1 保证时间维度长度不变
+        self.temporal_conv = nn.Sequential(
+            nn.Conv1d(dim, dim, kernel_size=3, padding=1, groups=1),
+            nn.BatchNorm1d(dim),  # 或者使用 GroupNorm/LayerNorm，这里用 BN 配合 Conv 比较经典
+            nn.GELU()
+        )
+
+        # --- Spatial Convolution (替代 Spatial Attention) ---
+        self.norm2 = nn.LayerNorm(dim)
+        # kernel_size=3, padding=1 保证空间Patch数量不变
+        self.spatial_conv = nn.Sequential(
+            nn.Conv1d(dim, dim, kernel_size=3, padding=1, groups=1),
+            nn.BatchNorm1d(dim),
+            nn.GELU()
+        )
+
+        # --- MLP (保持不变) ---
+        self.norm3 = nn.LayerNorm(dim)
+        # 复用 Timesformer.py 里已有的 Mlp 类
+        self.mlp = Mlp(in_features=dim, hidden_features=int(dim * mlp_ratio), drop=drop)
+
+    def forward(self, x):
+        # 输入 x: [B, T*N, D]
+        B, Total, D = x.shape
+        T = self.num_frames
+        N = self.num_patches
+
+        # === 1. Temporal Convolution ===
+        # 目标: 在 Time 维度上卷积
+        residual = x
+        x = self.norm1(x)
+
+        # 变换: [B, T*N, D] -> [B, T, N, D] -> [B, N, T, D] -> [B*N, D, T]
+        # Conv1d 需要输入 (Batch, Channels, Length)
+        x = x.view(B, T, N, D).permute(0, 2, 3, 1).reshape(B * N, D, T)
+
+        x = self.temporal_conv(x)
+
+        # 还原: [B*N, D, T] -> [B, N, D, T] -> [B, T, N, D] -> [B, T*N, D]
+        x = x.view(B, N, D, T).permute(0, 3, 1, 2).reshape(B, Total, D)
+
+        x = residual + x
+
+        # === 2. Spatial Convolution ===
+        # 目标: 在 Patch 维度上卷积
+        residual = x
+        x = self.norm2(x)
+
+        # 变换: [B, T*N, D] -> [B, T, N, D] -> [B*T, D, N]
+        x = x.view(B, T, N, D).permute(0, 1, 3, 2).reshape(B * T, D, N)
+
+        x = self.spatial_conv(x)
+
+        # 还原: [B*T, D, N] -> [B, T, D, N] -> [B, T, N, D] -> [B, T*N, D]
+        x = x.view(B, T, D, N).permute(0, 1, 3, 2).reshape(B, Total, D)
+
+        x = residual + x
+
+        # === 3. MLP ===
+        x = x + self.mlp(self.norm3(x))
+
+        return x

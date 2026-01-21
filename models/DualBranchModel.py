@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from .TemporalFusionModule import TemporalFusionModule
-from .Timesformer import TimeSformerBlock, BIE, BIE_Concat
+from .Timesformer import TimeSformerBlock, BIE, BIE_Concat, ConvBlock
 # 引入之前写好的 Embedding 模块
 from .Embed import CustomPatchEmbedding, VideoPatchEmbeddingWrapper
 
@@ -46,13 +46,13 @@ class DualBranchRecurrentModel(nn.Module):
         # =========================================================
         # num_patches=6 是由 CustomPatchEmbedding 决定的
         self.hbo2_blocks = nn.ModuleList([
-            TimeSformerBlock(embed_dim, num_heads, chunk_size, num_patches,drop=drop,attn_drop=attn_drop) for _ in range(depth)
+            ConvBlock(embed_dim, num_heads, chunk_size, num_patches,drop=drop,attn_drop=attn_drop) for _ in range(depth)
         ])
         self.hbr_blocks = nn.ModuleList([
-            TimeSformerBlock(embed_dim, num_heads, chunk_size, num_patches,drop=drop,attn_drop=attn_drop) for _ in range(depth)
+            ConvBlock(embed_dim, num_heads, chunk_size, num_patches,drop=drop,attn_drop=attn_drop) for _ in range(depth)
         ])
         self.bie_layers = nn.ModuleList([
-            BIE_Concat(embed_dim, num_heads) for _ in range(depth)
+            BIE(embed_dim, num_heads) for _ in range(depth)
         ])
 
         # =========================================================
