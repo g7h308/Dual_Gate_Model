@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from collections import deque
-
+import math
 
 class Mlp(nn.Module):
     def __init__(self, in_features, hidden_features=None, act_layer=nn.GELU, drop=0.):
@@ -213,9 +213,10 @@ class BIE_Concat(nn.Module):
 
 class ConvBlock(nn.Module):
     """
-    用于消融实验的卷积块，完全替代 TimeSformerBlock。
-    使用 1D 卷积分别在 '时间' 和 '空间' 维度上进行特征提取。
-    接口参数保持一致，以便无缝替换。
+    简化版 ConvBlock：
+    1. 仅保留 Spatial 维度处理（不看时间）。
+    2. 使用 Conv1d 替代 Conv2d，避免处理复杂的 grid_size 问题。
+    3. 将 [Patch1, Patch2, ...] 视为一个简单的 1D 序列。
     """
 
     def __init__(self, dim, num_heads, num_frames, num_patches, mlp_ratio=4., qkv_bias=False, drop=0., attn_drop=0.):
@@ -223,67 +224,55 @@ class ConvBlock(nn.Module):
         self.num_frames = num_frames
         self.num_patches = num_patches
 
-        # --- Temporal Convolution (替代 Temporal Attention) ---
-        self.norm1 = nn.LayerNorm(dim)
-        # kernel_size=3, padding=1 保证时间维度长度不变
-        self.temporal_conv = nn.Sequential(
-            nn.Conv1d(dim, dim, kernel_size=3, padding=1, groups=1),
-            nn.BatchNorm1d(dim),  # 或者使用 GroupNorm/LayerNorm，这里用 BN 配合 Conv 比较经典
-            nn.GELU()
-        )
-
-        # --- Spatial Convolution (替代 Spatial Attention) ---
+        # --- 1. Spatial Convolution (1D) ---
         self.norm2 = nn.LayerNorm(dim)
-        # kernel_size=3, padding=1 保证空间Patch数量不变
+
+        # 使用 1D 卷积处理 N 个 Patch
+        # kernel_size=3, padding=1 保证输出的 Patch 数量 N 不变
         self.spatial_conv = nn.Sequential(
             nn.Conv1d(dim, dim, kernel_size=3, padding=1, groups=1),
-            nn.BatchNorm1d(dim),
+            nn.BatchNorm1d(dim),  # 1D 卷积配 BN1d
             nn.GELU()
         )
 
-        # --- MLP (保持不变) ---
+        # --- 2. MLP (保持不变) ---
         self.norm3 = nn.LayerNorm(dim)
-        # 复用 Timesformer.py 里已有的 Mlp 类
         self.mlp = Mlp(in_features=dim, hidden_features=int(dim * mlp_ratio), drop=drop)
 
     def forward(self, x):
-        # 输入 x: [B, T*N, D]
+        # 输入 x: [B, Total, D] -> 其中 Total = T * N
         B, Total, D = x.shape
         T = self.num_frames
         N = self.num_patches
 
-        # === 1. Temporal Convolution ===
-        # 目标: 在 Time 维度上卷积
-        residual = x
-        x = self.norm1(x)
-
-        # 变换: [B, T*N, D] -> [B, T, N, D] -> [B, N, T, D] -> [B*N, D, T]
-        # Conv1d 需要输入 (Batch, Channels, Length)
-        x = x.view(B, T, N, D).permute(0, 2, 3, 1).reshape(B * N, D, T)
-
-        x = self.temporal_conv(x)
-
-        # 还原: [B*N, D, T] -> [B, N, D, T] -> [B, T, N, D] -> [B, T*N, D]
-        x = x.view(B, N, D, T).permute(0, 3, 1, 2).reshape(B, Total, D)
-
-        x = residual + x
-
-        # === 2. Spatial Convolution ===
-        # 目标: 在 Patch 维度上卷积
+        # === Spatial Convolution (Conv1d) ===
+        # 目标: 在每一帧内部，对 N 个 Patch 进行局部交互
         residual = x
         x = self.norm2(x)
 
-        # 变换: [B, T*N, D] -> [B, T, N, D] -> [B*T, D, N]
-        x = x.view(B, T, N, D).permute(0, 1, 3, 2).reshape(B * T, D, N)
+        # 1. 拆分维度: [B, T*N, D] -> [B, T, N, D]
+        x = x.view(B, T, N, D)
 
+        # 2. 合并 Batch 和 Time (每一帧独立处理): [B, T, N, D] -> [B*T, N, D]
+        x = x.reshape(B * T, N, D)
+
+        # 3. 调整为 Conv1d 格式 (Channels 在中间): [B*T, N, D] -> [B*T, D, N]
+        x = x.permute(0, 2, 1)
+
+        # 4. 执行 1D 卷积
+        # 它会在 N (Patch序列) 这个维度上滑动
+        # 例如: Patch 0 会和 Patch 1 交互，Patch 1 会和 0, 2 交互
         x = self.spatial_conv(x)
 
-        # 还原: [B*T, D, N] -> [B, T, D, N] -> [B, T, N, D] -> [B, T*N, D]
-        x = x.view(B, T, D, N).permute(0, 1, 3, 2).reshape(B, Total, D)
+        # 5. 还原形状
+        # [B*T, D, N] -> [B*T, N, D]
+        x = x.permute(0, 2, 1)
+        # [B*T, N, D] -> [B, T, N, D] -> [B, T*N, D]
+        x = x.reshape(B, T, N, D).reshape(B, Total, D)
 
         x = residual + x
 
-        # === 3. MLP ===
+        # === MLP ===
         x = x + self.mlp(self.norm3(x))
 
         return x

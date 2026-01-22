@@ -46,10 +46,10 @@ class DualBranchRecurrentModel(nn.Module):
         # =========================================================
         # num_patches=6 是由 CustomPatchEmbedding 决定的
         self.hbo2_blocks = nn.ModuleList([
-            ConvBlock(embed_dim, num_heads, chunk_size, num_patches,drop=drop,attn_drop=attn_drop) for _ in range(depth)
+            TimeSformerBlock(embed_dim, num_heads, chunk_size, num_patches,drop=drop,attn_drop=attn_drop) for _ in range(depth)
         ])
         self.hbr_blocks = nn.ModuleList([
-            ConvBlock(embed_dim, num_heads, chunk_size, num_patches,drop=drop,attn_drop=attn_drop) for _ in range(depth)
+            TimeSformerBlock(embed_dim, num_heads, chunk_size, num_patches,drop=drop,attn_drop=attn_drop) for _ in range(depth)
         ])
         self.bie_layers = nn.ModuleList([
             BIE(embed_dim, num_heads) for _ in range(depth)

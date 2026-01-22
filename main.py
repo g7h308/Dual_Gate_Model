@@ -274,7 +274,7 @@ def get_args():
     parser.add_argument('--k_folds', type=int, default=5)
     parser.add_argument('--roi_mode',type=str, default='original',choices=('original', 'full', 'hemi_4_5', 'hemi_5_4','three_columns'),
                         help='original:6脑区，full：不划分  hemi_4_5:左脑4右脑5  three_columns:三等分')
-    parser.add_argument('--special note',type=str,default='消融实验：Timesformer换为时间卷积+空间卷积')
+    parser.add_argument('--special note',type=str,default='消融实验，只有空间卷积SpatialConv')
     return parser.parse_args()
 
 
