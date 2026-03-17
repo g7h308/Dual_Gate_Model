@@ -18,10 +18,13 @@ from sklearn.model_selection import KFold
 
 from models.DualBranchModel import DualBranchRecurrentModel
 # 引入新的加载函数
-from dataloader.VFTDataLoader import load_raw_data, augment_data_odd_even, DualModalityDataset
+from dataloader.VFTDataLoader import load_raw_data, augment_data_odd_even, DualModalityDataset, load_excel_channel_data_dual
 
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
 from torch.nn.functional import dropout, softmax # 引入 softmax 计算概率
+
+from PCMCI import compute_causal_prior_from_channels
+
 # ==========================================
 # 1. 工具函数
 # ==========================================
@@ -195,7 +198,7 @@ def calculate_metrics(all_labels, all_preds, all_probs):
 # ==========================================
 # 4. 训练与评估
 # ==========================================
-def train_one_epoch(model, loader, criterion, optimizer, device):
+def train_one_epoch(model, loader, criterion, optimizer, device, A_causal_oxy, A_causal_dxy):
     model.train()
     running_loss = 0.0
     all_labels = []
@@ -205,7 +208,7 @@ def train_one_epoch(model, loader, criterion, optimizer, device):
     for oxy, dxy, labels in loader:
         oxy, dxy, labels = oxy.to(device), dxy.to(device), labels.to(device)
         optimizer.zero_grad()
-        outputs = model(oxy, dxy)
+        outputs = model(oxy, dxy, A_causal_oxy,A_causal_dxy)
         loss = criterion(outputs, labels)
         loss.backward()
         optimizer.step()
@@ -222,7 +225,7 @@ def train_one_epoch(model, loader, criterion, optimizer, device):
     return running_loss / len(loader.dataset), metrics
 
 
-def evaluate(model, loader, criterion, device):
+def evaluate(model, loader, criterion, device, A_causal_oxy, A_causal_dxy):
     model.eval()
     running_loss = 0.0
     all_labels = []
@@ -232,7 +235,7 @@ def evaluate(model, loader, criterion, device):
     with torch.no_grad():
         for oxy, dxy, labels in loader:
             oxy, dxy, labels = oxy.to(device), dxy.to(device), labels.to(device)
-            outputs = model(oxy, dxy)
+            outputs = model(oxy, dxy, A_causal_oxy, A_causal_dxy)
             loss = criterion(outputs, labels)
             running_loss += loss.item() * labels.size(0)
 
@@ -274,7 +277,7 @@ def get_args():
     parser.add_argument('--k_folds', type=int, default=5)
     parser.add_argument('--roi_mode',type=str, default='original',choices=('original', 'full', 'hemi_4_5', 'hemi_5_4','three_columns'),
                         help='original:6脑区，full：不划分  hemi_4_5:左脑4右脑5  three_columns:三等分')
-    parser.add_argument('--special note',type=str,default='消融实验，只有空间卷积SpatialConv')
+    parser.add_argument('--special note',type=str,default='')
     return parser.parse_args()
 
 
@@ -299,6 +302,27 @@ def main():
         # Shape: (N_subjects, T, C, H, W)
         X_oxy_all, X_dxy_all, y_all = load_raw_data(args)
 
+        # 还原真正的 target_len (因为 load_raw_data 里 np.delete 删掉了第0帧)
+        target_len = X_oxy_all.shape[1] + 1
+
+        # 加载未变成 grid 的原始通道数据 (双模态)
+        X_chan_oxy_all, X_chan_dxy_all = load_excel_channel_data_dual(args.data_path, target_len=target_len)
+
+        # 为了和 npy 严格对齐，通道数据也要删掉时间轴(axis=2)的第0帧
+        X_chan_oxy_all = np.delete(X_chan_oxy_all, 0, axis=2)
+        X_chan_dxy_all = np.delete(X_chan_dxy_all, 0, axis=2)
+
+        # 定义你提供的 ROI 映射
+        roi_mapping = [
+            [0, 4, 5],  # ROI 0
+            [1, 2],  # ROI 1
+            [3, 7, 8],  # ROI 2
+            [9, 13, 14, 18],  # ROI 3
+            [6, 10, 11, 15, 19, 20],  # ROI 4
+            [12, 16, 17, 21]  # ROI 5
+        ]
+
+
         logger.info(f"Loaded raw data. Total subjects: {len(y_all)}")
 
         # 2. 定义 K-Fold (基于 Subject ID 进行划分)
@@ -321,6 +345,23 @@ def main():
             X_val_oxy_raw = X_oxy_all[val_idx]
             X_val_dxy_raw = X_dxy_all[val_idx]
             y_val_raw = y_all[val_idx]
+
+
+            logger.info(">>> 开始计算当前折的 Oxy 和 Dxy 因果先验...")
+            X_train_chan_oxy = X_chan_oxy_all[train_idx]
+            X_train_chan_dxy = X_chan_dxy_all[train_idx]
+
+            # 计算 Oxy 矩阵并送入 GPU
+            A_causal_oxy = compute_causal_prior_from_channels(
+                fnirs_channel_data=X_train_chan_oxy, roi_mapping=roi_mapping
+            ).to(device)
+
+            # 计算 Dxy 矩阵并送入 GPU
+            A_causal_dxy = compute_causal_prior_from_channels(
+                fnirs_channel_data=X_train_chan_dxy, roi_mapping=roi_mapping
+            ).to(device)
+            logger.info(">>> 双因果先验计算完成！")
+
 
             # --- 关键步骤：然后在各自集合内独立进行扩充 ---
             # 这样 Train 里的扩充样本只来自 Train Subject，Val 同理
@@ -364,9 +405,9 @@ def main():
 
             # --- 训练 ---
             for epoch in range(args.epochs):
-                train_loss, t_m = train_one_epoch(model, train_loader, criterion, optimizer, device)
-                val_loss, v_m = evaluate(model, val_loader, criterion, device)
-
+                train_loss, t_m = train_one_epoch(model, train_loader, criterion, optimizer, device, A_causal_oxy,
+                                                  A_causal_dxy)
+                val_loss, v_m = evaluate(model, val_loader, criterion, device, A_causal_oxy, A_causal_dxy)
                 train_losses.append(train_loss)
                 val_losses.append(val_loss)
 
@@ -385,7 +426,7 @@ def main():
             # --- 验证 ---
             if os.path.exists(best_model_path):
                 model.load_state_dict(torch.load(best_model_path))
-                f_loss, f_m = evaluate(model, val_loader, criterion, device)
+                f_loss, f_m = evaluate(model, val_loader, criterion, device, A_causal_oxy, A_causal_dxy)
                 logger.info(
                     f"Fold {fold + 1} BEST Result -> Acc: {f_m['acc']:.4f}, Pre: {f_m['precision']:.4f}, Rec: {f_m['recall']:.4f}, F1: {f_m['f1']:.4f}, AUC: {f_m['auc']:.4f}")
                 fold_final_metrics.append(f_m)

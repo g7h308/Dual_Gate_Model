@@ -28,7 +28,7 @@ class TimeSformerBlock(nn.Module):
     先做 Temporal Attention，再做 Spatial Attention
     """
 
-    def __init__(self, dim, num_heads, num_frames, num_patches, mlp_ratio=4., qkv_bias=False, drop=0., attn_drop=0.):
+    def __init__(self, dim, num_heads, num_frames, num_patches, mlp_ratio=4., qkv_bias=False, drop=0., attn_drop=0., num_lags=11):
         super().__init__()
         self.num_frames = num_frames
         self.num_patches = num_patches
@@ -41,11 +41,19 @@ class TimeSformerBlock(nn.Module):
         self.norm2 = nn.LayerNorm(dim)
         self.spatial_attn = nn.MultiheadAttention(dim, num_heads, dropout=attn_drop, batch_first=True)
 
+        # =========================================================
+        # 【新增】：因果先验 (PCMCI) 注入组件
+        # =========================================================
+        # 1. 滞后时间压缩：把 11 维滞后压缩成 1 维标量
+        self.lag_compressor = nn.Linear(num_lags, 1)
+        # 换成一个标量 Alpha，初始值设为 0.01（防止初期梯度爆炸）
+        self.causal_alpha = nn.Parameter(torch.tensor(0.01))
+
         # --- MLP ---
         self.norm3 = nn.LayerNorm(dim)
         self.mlp = Mlp(in_features=dim, hidden_features=int(dim * mlp_ratio), drop=drop)
 
-    def forward(self, x):
+    def forward(self, x, A_causal=None):
         # 输入 x: [B, T*N, D]
         B, Total, D = x.shape
         T = self.num_frames
@@ -91,21 +99,29 @@ class TimeSformerBlock(nn.Module):
         # Reshape: [B, T, N, D] -> [B*T, N, D]
         x = x.reshape(B * T, N, D)
 
-        # Self-Attention (sequence_len = N)
-        x, _ = self.spatial_attn(x, x, x)
+        x_attn, _ = self.spatial_attn(x, x, x)
 
-        # 还原形状
-        # [B*T, N, D] -> [B, T, N, D]
-        x = x.view(B, T, N, D)
-        # [B, T, N, D] -> [B, T*N, D]
-        x = x.reshape(B, T * N, D)
+        if A_causal is not None:
+            # 1. 压缩时间滞后: [N, N, 11] -> [N, N]
+            A_comp = self.lag_compressor(A_causal).squeeze(-1)
 
-        # 残差连接
+            # 2. 让特征顺着因果图流动
+            # A_comp[i, j] 是 Source i 对 Target j 的因果强度
+            # x 形状是 [B*T, N_source, D_feature]
+            # einsum 魔法：Target j 吸收所有 Source i 的特征，得到 [B*T, N_target, D_feature]
+            causal_flow = torch.einsum('ij, bid -> bjd', A_comp, x)
+
+            # 3. 将因果特征按一定比例 (alpha) 融入原本的注意力特征中
+            x = x_attn + self.causal_alpha * causal_flow
+        else:
+            x = x_attn
+
+            # 还原形状
+        x = x.view(B, T, N, D).reshape(B, T * N, D)
         x = x + residual
 
         # === 3. MLP ===
         x = x + self.mlp(self.norm3(x))
-
         return x
 
 

@@ -67,7 +67,7 @@ class DualBranchRecurrentModel(nn.Module):
             nn.Linear(embed_dim, num_classes)
         )
 
-    def forward_one_step(self, hbo2_emb, hbr_emb):
+    def forward_one_step(self, hbo2_emb, hbr_emb, A_causal_oxy=None, A_causal_dxy=None):
         """
         处理单个时间步(chunk)的前向传播
         输入形状: [B, Chunk_Size, N, D]  (例如: [B, 10, 6, 64])
@@ -82,8 +82,9 @@ class DualBranchRecurrentModel(nn.Module):
 
         # 1. 经过多层 TimeSformer + BIE 提取特征
         for i in range(self.depth):
-            x1 = self.hbo2_blocks[i](x1)
-            x2 = self.hbr_blocks[i](x2)
+            x1 = self.hbo2_blocks[i](x1, A_causal_oxy)
+            x2 = self.hbr_blocks[i](x2, A_causal_dxy)
+
             x1, x2 = self.bie_layers[i](x1, x2)
 
         # 2. 进入 Fusion Module 与历史记忆融合
@@ -94,7 +95,7 @@ class DualBranchRecurrentModel(nn.Module):
 
         return f_t_hbo2, f_t_hbr
 
-    def forward(self, hbo2_raw, hbr_raw):
+    def forward(self, hbo2_raw, hbr_raw, A_causal_oxy=None, A_causal_dxy=None):
         """
         主循环逻辑
         Input:
@@ -135,7 +136,11 @@ class DualBranchRecurrentModel(nn.Module):
             emb_hbr = self.video_wrapper_hbr(chunk_hbr)
 
             # 3. Backbone Step
-            out_hbo2, out_hbr = self.forward_one_step(emb_hbo2, emb_hbr)
+            out_hbo2, out_hbr = self.forward_one_step(
+                emb_hbo2, emb_hbr,
+                A_causal_oxy=A_causal_oxy,
+                A_causal_dxy=A_causal_dxy
+            )
 
             # 如果是最后一次循环，保存结果
             if t == time_steps - step:
