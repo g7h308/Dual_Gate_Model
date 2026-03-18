@@ -277,6 +277,8 @@ def get_args():
     parser.add_argument('--k_folds', type=int, default=5)
     parser.add_argument('--roi_mode',type=str, default='original',choices=('original', 'full', 'hemi_4_5', 'hemi_5_4','three_columns'),
                         help='original:6脑区，full：不划分  hemi_4_5:左脑4右脑5  three_columns:三等分')
+    parser.add_argument('--keep_ratio', type=float, default=0.4, help='保留因果矩阵中最强连接的比例 (Top-K)')
+
     parser.add_argument('--special note',type=str,default='')
     return parser.parse_args()
 
@@ -362,6 +364,8 @@ def main():
             ).to(device)
             logger.info(">>> 双因果先验计算完成！")
 
+            # print(A_causal_dxy)
+            # print(A_causal_oxy)
 
             # --- 关键步骤：然后在各自集合内独立进行扩充 ---
             # 这样 Train 里的扩充样本只来自 Train Subject，Val 同理
@@ -389,7 +393,8 @@ def main():
                 num_classes=args.num_classes,
                 drop=args.dropout,
                 attn_drop=args.attn_drop,
-                roi_mode=args.roi_mode
+                roi_mode=args.roi_mode,
+                keep_ratio=args.keep_ratio
             ).to(device)
 
             criterion = nn.CrossEntropyLoss()

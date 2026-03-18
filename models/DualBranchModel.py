@@ -14,7 +14,7 @@ class DualBranchRecurrentModel(nn.Module):
                  depth=3,
                  k_memory=20,
                  num_classes=2,
-                 chunk_size=10,drop=0.,attn_drop=0.,roi_mode='original'):  # 新增 chunk_size，对应 TimeSformer 的时间窗口
+                 chunk_size=10,drop=0.,attn_drop=0.,roi_mode='original', keep_ratio=0.4):  # 新增 chunk_size，对应 TimeSformer 的时间窗口
         super().__init__()
 
         self.depth = depth
@@ -46,10 +46,10 @@ class DualBranchRecurrentModel(nn.Module):
         # =========================================================
         # num_patches=6 是由 CustomPatchEmbedding 决定的
         self.hbo2_blocks = nn.ModuleList([
-            TimeSformerBlock(embed_dim, num_heads, chunk_size, num_patches,drop=drop,attn_drop=attn_drop) for _ in range(depth)
+            TimeSformerBlock(embed_dim, num_heads, chunk_size, num_patches,drop=drop,attn_drop=attn_drop, keep_ratio=keep_ratio) for _ in range(depth)
         ])
         self.hbr_blocks = nn.ModuleList([
-            TimeSformerBlock(embed_dim, num_heads, chunk_size, num_patches,drop=drop,attn_drop=attn_drop) for _ in range(depth)
+            TimeSformerBlock(embed_dim, num_heads, chunk_size, num_patches,drop=drop,attn_drop=attn_drop, keep_ratio=keep_ratio) for _ in range(depth)
         ])
         self.bie_layers = nn.ModuleList([
             BIE(embed_dim, num_heads) for _ in range(depth)
