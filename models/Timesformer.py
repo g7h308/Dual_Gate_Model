@@ -105,26 +105,18 @@ class TimeSformerBlock(nn.Module):
         # ===================================================
         causal_mask = None
         if A_causal is not None:
-            print(A_causal)
-            # 1. 靜態壓縮：沿著時間滯後維度 (dim=-1) 取絕對值的最大值
             A_comp, _ = torch.max(torch.abs(A_causal), dim=-1)
-            print(A_comp)
+            #print(A_comp)
 
             # 2. 方向對齊: 將 [Source, Target] 轉置為 [Query, Key] 的形狀
             A_attn = A_comp.transpose(0, 1)
-            print(A_attn)
+            #print(A_attn)
 
-            # 3. 動態尋找相對閾值 (基於傳入的 self.keep_ratio)
-            flat_A = A_attn.flatten()
-            # 例如 keep_ratio=0.4 時，就是取第 60% 位置的數值作為及格線
-            threshold_val = torch.quantile(flat_A, 1.0 - self.keep_ratio)
-
-            print(threshold_val)
-            # 4. 生成 Bool 硬掩碼！
-            # 邏輯：小於及格線的邊 -> 標記為 True (官方 API 會自動切斷這些因果)
-            # 大於等於及格線的核心邊 -> 標記為 False (允許注意力通行)
-            causal_mask = (A_attn < threshold_val)
-            print(causal_mask)
+            # 3. 生成 Bool 硬掩碼！
+            # 邏輯：等於 0.0 的元素 -> 標記為 True (官方 API 會自動切斷這些因果/遮掩掉)
+            # 不等於 0.0 的元素 -> 標記為 False (允許注意力通行)
+            causal_mask = (A_attn == 0.0)
+            #print(causal_mask)
         # 【修改 5】：將生成的 causal_mask 傳給官方的 attn_mask 參數
         x_attn, _ = self.spatial_attn(x, x, x, attn_mask=causal_mask)
 
