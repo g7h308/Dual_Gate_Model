@@ -353,16 +353,36 @@ def main():
             X_train_chan_oxy = X_chan_oxy_all[train_idx]
             X_train_chan_dxy = X_chan_dxy_all[train_idx]
 
-            # 计算 Oxy 矩阵并送入 GPU
-            A_causal_oxy = compute_causal_prior_from_channels(
-                fnirs_channel_data=X_train_chan_oxy, roi_mapping=roi_mapping
+            train_adhd_mask = (y_train_raw == 0)
+            train_hc_mask = (y_train_raw == 1)
+
+            # 2. ====== 处理 Oxy 因果矩阵 ======
+            # 分别计算 ADHD 和 HC 的 Oxy 矩阵
+            A_causal_oxy_adhd = compute_causal_prior_from_channels(
+                fnirs_channel_data=X_train_chan_oxy[train_adhd_mask], roi_mapping=roi_mapping
             ).to(device)
 
-            # 计算 Dxy 矩阵并送入 GPU
-            A_causal_dxy = compute_causal_prior_from_channels(
-                fnirs_channel_data=X_train_chan_dxy, roi_mapping=roi_mapping
+            A_causal_oxy_hc = compute_causal_prior_from_channels(
+                fnirs_channel_data=X_train_chan_oxy[train_hc_mask], roi_mapping=roi_mapping
             ).to(device)
-            logger.info(">>> 双因果先验计算完成！")
+
+            # 取并集：只要 ADHD 或 HC 中存在非 0 的连接，我们就给它赋值为 1.0，否则为 0.0
+            A_causal_oxy = torch.where((A_causal_oxy_adhd != 0) | (A_causal_oxy_hc != 0), 1.0, 0.0)
+
+            # 3. ====== 处理 Dxy 因果矩阵 ======
+            # 分别计算 ADHD 和 HC 的 Dxy 矩阵
+            A_causal_dxy_adhd = compute_causal_prior_from_channels(
+                fnirs_channel_data=X_train_chan_dxy[train_adhd_mask], roi_mapping=roi_mapping
+            ).to(device)
+
+            A_causal_dxy_hc = compute_causal_prior_from_channels(
+                fnirs_channel_data=X_train_chan_dxy[train_hc_mask], roi_mapping=roi_mapping
+            ).to(device)
+
+            # 取并集
+            A_causal_dxy = torch.where((A_causal_dxy_adhd != 0) | (A_causal_dxy_hc != 0), 1.0, 0.0)
+
+            logger.info(">>> 双因果先验（ADHD与HC并集）计算完成！")
 
             # print(A_causal_dxy)
             # print(A_causal_oxy)

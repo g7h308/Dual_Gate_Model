@@ -54,23 +54,18 @@ def compute_causal_prior_from_channels(fnirs_channel_data, roi_mapping, tau_max=
     for i, channels in enumerate(roi_mapping):
         roi_data[:, i, :] = np.mean(cleaned_channel_data[:, channels, :], axis=1)
 
-    # =========================================================
-    # 步骤 3：抗混叠降采样 (Decimate)
-    # 自动应用低通滤波后再抽头，防止高频噪声混叠到低频
-    # =========================================================
     downsample_factor = 10
-    roi_data_downsampled = decimate(roi_data, q=downsample_factor, ftype='iir', axis=-1)
+    roi_data_downsampled = roi_data[:, :, ::downsample_factor]
 
     # =========================================================
     # 步骤 4：一阶差分 (打破残存的极高自相关性)
     # 计算变化率，此时时间维度会减 1
     # =========================================================
-    roi_data_diff = np.diff(roi_data_downsampled, axis=-1)
 
     # =========================================================
     # 步骤 5：Tigramite PCMCI 因果推断
     # =========================================================
-    data_for_tigramite = np.transpose(roi_data_diff, (0, 2, 1))
+    data_for_tigramite = np.transpose(roi_data_downsampled, (0, 2, 1))
     var_names = [f'ROI_{i}' for i in range(num_rois)]
 
     dataframe = pp.DataFrame(
