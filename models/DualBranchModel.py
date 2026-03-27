@@ -95,7 +95,7 @@ class DualBranchRecurrentModel(nn.Module):
 
         return f_t_hbo2, f_t_hbr
 
-    def forward(self, hbo2_raw, hbr_raw, A_causal_oxy=None, A_causal_dxy=None):
+    def forward(self, hbo2_raw, hbr_raw, A_causal_oxy=None, A_causal_dxy=None, return_features=False):
         """
         主循环逻辑
         Input:
@@ -165,6 +165,8 @@ class DualBranchRecurrentModel(nn.Module):
         # 分类
         logits = self.classifier(combined_feat)
 
+        if return_features:
+            return logits, combined_feat  # 同时返回预测结果和高维特征
         return logits
 
 

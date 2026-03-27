@@ -20,10 +20,40 @@ from models.DualBranchModel import DualBranchRecurrentModel
 # 引入新的加载函数
 from dataloader.VFTDataLoader import load_raw_data, augment_data_odd_even, DualModalityDataset, load_excel_channel_data_dual
 
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score, confusion_matrix
 from torch.nn.functional import dropout, softmax # 引入 softmax 计算概率
 
 from PCMCI import compute_causal_prior_from_channels
+
+import seaborn as sns
+
+
+def plot_mean_std_conf_matrix(cm_list, save_path):
+    """
+    cm_list: 包含 K 个混淆矩阵的列表 [cm1, cm2, ..., cmK]
+    """
+    cms = np.array(cm_list)  # 形状: (K, 2, 2)
+
+    # 计算均值和标准差
+    cm_mean = np.mean(cms, axis=0)
+    cm_std = np.std(cms, axis=0)
+
+    # 构建显示在方格里的文字标签 (Mean ± Std)
+    # 也可以选择只显示百分比，或者 Mean(Std)
+    annot = np.empty_like(cm_mean).astype(str)
+    rows, cols = cm_mean.shape
+    for r in range(rows):
+        for c in range(cols):
+            annot[r, c] = f"{cm_mean[r, c]:.2f}\n±{cm_std[r, c]:.2f}"
+
+    plt.figure(figsize=(8, 6))
+    sns.heatmap(cm_mean, annot=annot, fmt="", cmap='Blues',
+                xticklabels=['ADHD', 'HC'], yticklabels=['ADHD', 'HC'])
+    plt.xlabel('Predicted')
+    plt.ylabel('Actual')
+    plt.title('Average Confusion Matrix (Mean ± Std)')
+    plt.savefig(os.path.join(save_path, 'cm_mean_std.png'))
+    plt.close()
 
 # ==========================================
 # 1. 工具函数
@@ -174,25 +204,26 @@ class EarlyStopping:
 
 
 def calculate_metrics(all_labels, all_preds, all_probs):
-    """
-    计算五个指标
-    """
     acc = accuracy_score(all_labels, all_preds)
     precision = precision_score(all_labels, all_preds, zero_division=0)
     recall = recall_score(all_labels, all_preds, zero_division=0)
     f1 = f1_score(all_labels, all_preds, zero_division=0)
+
+    # 核心：计算混淆矩阵
+    cm = confusion_matrix(all_labels, all_preds, labels=[0, 1])
+
     try:
-        # 假设是二分类，取正类的概率
         auc = roc_auc_score(all_labels, all_probs[:, 1])
     except:
-        auc = 0.5  # 防止只有一个类别的异常情况
+        auc = 0.5
 
     return {
         "acc": acc,
         "precision": precision,
         "recall": recall,
         "f1": f1,
-        "auc": auc
+        "auc": auc,
+        "cm": cm  # 返回矩阵用于后续统计
     }
 
 # ==========================================
@@ -248,6 +279,35 @@ def evaluate(model, loader, criterion, device, A_causal_oxy, A_causal_dxy):
 
     metrics = calculate_metrics(np.array(all_labels), np.array(all_preds), np.array(all_probs))
     return running_loss / len(loader.dataset), metrics
+
+
+def evaluate_with_features(model, loader, criterion, device, A_causal_oxy, A_causal_dxy):
+    model.eval()
+    running_loss = 0.0
+    all_labels = []
+    all_preds = []
+    all_probs = []
+    all_features = []  # 新增：用于存储特征
+
+    with torch.no_grad():
+        for oxy, dxy, labels in loader:
+            oxy, dxy, labels = oxy.to(device), dxy.to(device), labels.to(device)
+            # 调用修改后的 forward
+            outputs, features = model(oxy, dxy, A_causal_oxy, A_causal_dxy, return_features=True)
+
+            loss = criterion(outputs, labels)
+            running_loss += loss.item() * labels.size(0)
+
+            probs = softmax(outputs, dim=1)
+            _, predicted = outputs.max(1)
+
+            all_labels.extend(labels.cpu().numpy())
+            all_preds.extend(predicted.cpu().numpy())
+            all_probs.extend(probs.cpu().numpy())
+            all_features.extend(features.cpu().numpy())  # 收集特征
+
+    metrics = calculate_metrics(np.array(all_labels), np.array(all_preds), np.array(all_probs))
+    return running_loss / len(loader.dataset), metrics, np.array(all_features), np.array(all_labels)
 
 # ==========================================
 # 5. 主函数 (核心修改部分)
@@ -331,6 +391,7 @@ def main():
         kfold = KFold(n_splits=args.k_folds, shuffle=True, random_state=args.seed)
 
         fold_final_metrics = []
+        all_fold_cms = []  # 新增：用于收集每一折的矩阵
         device = torch.device(args.device)
 
         # 3. K-Fold 循环
@@ -369,6 +430,14 @@ def main():
             # 取并集：只要 ADHD 或 HC 中存在非 0 的连接，我们就给它赋值为 1.0，否则为 0.0
             A_causal_oxy = torch.where((A_causal_oxy_adhd != 0) | (A_causal_oxy_hc != 0), 1.0, 0.0)
 
+
+            binary_A_causal_oxy_adhd = (A_causal_oxy_adhd != 0).any(dim=2).float()
+            binary_A_causal_oxy_hc = (A_causal_oxy_hc != 0).any(dim=2).float()
+            logger.info(f"binary_A_causal_oxy_adhd): \n{binary_A_causal_oxy_adhd}")
+            logger.info(f"binary_A_causal_oxy_hc): \n{binary_A_causal_oxy_hc}")
+            binary_A_causal_oxy = (binary_A_causal_oxy_adhd.bool() | binary_A_causal_oxy_hc.bool()).float()
+            logger.info(f"binary_A_causal_oxy): \n{binary_A_causal_oxy}")
+
             # 3. ====== 处理 Dxy 因果矩阵 ======
             # 分别计算 ADHD 和 HC 的 Dxy 矩阵
             A_causal_dxy_adhd = compute_causal_prior_from_channels(
@@ -381,6 +450,13 @@ def main():
 
             # 取并集
             A_causal_dxy = torch.where((A_causal_dxy_adhd != 0) | (A_causal_dxy_hc != 0), 1.0, 0.0)
+
+            binary_A_causal_dxy_adhd = (A_causal_dxy_adhd != 0).any(dim=2).float()
+            binary_A_causal_dxy_hc = (A_causal_dxy_hc != 0).any(dim=2).float()
+            logger.info(f"binary_A_causal_dxy_adhd): \n{binary_A_causal_dxy_adhd}")
+            logger.info(f"binary_A_causal_dxy_hc): \n{binary_A_causal_dxy_hc}")
+            binary_A_causal_dxy = (binary_A_causal_dxy_adhd.bool() | binary_A_causal_dxy_hc.bool()).float()
+            logger.info(f"binary_A_causal_dxy): \n{binary_A_causal_dxy}")
 
             logger.info(">>> 双因果先验（ADHD与HC并集）计算完成！")
 
@@ -452,6 +528,8 @@ def main():
             if os.path.exists(best_model_path):
                 model.load_state_dict(torch.load(best_model_path))
                 f_loss, f_m = evaluate(model, val_loader, criterion, device, A_causal_oxy, A_causal_dxy)
+                fold_final_metrics.append(f_m)
+                all_fold_cms.append(f_m['cm'])
                 logger.info(
                     f"Fold {fold + 1} BEST Result -> Acc: {f_m['acc']:.4f}, Pre: {f_m['precision']:.4f}, Rec: {f_m['recall']:.4f}, F1: {f_m['f1']:.4f}, AUC: {f_m['auc']:.4f}")
                 fold_final_metrics.append(f_m)
@@ -459,6 +537,12 @@ def main():
                 fold_final_metrics.append({"acc": 0, "precision": 0, "recall": 0, "f1": 0, "auc": 0})
 
         # --- 总结 ---
+
+        # 1. 调用绘图函数生成均值标准差矩阵图
+        if len(all_fold_cms) > 0:
+            plot_mean_std_conf_matrix(all_fold_cms, temp_save_path)
+
+        # 2. 打印原有的指标总结
         logger.info("\n" + "=" * 30)
         logger.info(f"Final {args.k_folds}-Fold CV Summary:")
         for m_name in ["acc", "precision", "recall", "f1", "auc"]:
