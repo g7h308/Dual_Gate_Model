@@ -10,6 +10,14 @@ import json
 
 from sklearn.manifold import TSNE
 
+PLOT_FONT_CONFIG = {
+    'family': 'Times New Roman',  # 统一字体样式：新罗马
+    'axis_label_size': 21,  # X轴、Y轴标签文字大小 (如 Predicted, Actual)
+    'tick_label_size': 21,  # 坐标轴刻度数字、Colorbar数字的大小
+    'annot_size': 30,  # 混淆矩阵内部 4 个数字的大小
+    'legend_size': 18  # t-SNE 图例中文字的大小
+}
+
 
 def plot_tsne(features, labels, save_path, fold_idx, title_prefix="Val Set"):
     """
@@ -29,13 +37,26 @@ def plot_tsne(features, labels, save_path, fold_idx, title_prefix="Val Set"):
         plt.scatter(features_2d[mask, 0], features_2d[mask, 1],
                     c=colors[i], label=class_name, alpha=0.6, edgecolors='w')
 
-    plt.title(f'{title_prefix} t-SNE - Fold {fold_idx}')
-    plt.legend()
+    # 删除标题 (已注释)
+    # plt.title(f'{title_prefix} t-SNE - Fold {fold_idx}')
+
+    # --- 从字典读取配置 ---
+    font_family = PLOT_FONT_CONFIG['family']
+    tick_size = PLOT_FONT_CONFIG['tick_label_size']
+    legend_size = PLOT_FONT_CONFIG['legend_size']
+
+    # 调整坐标轴上的数字字体样式和大小
+    plt.xticks(fontname=font_family, fontsize=tick_size)
+    plt.yticks(fontname=font_family, fontsize=tick_size)
+
+    # 调整图例字体
+    plt.legend(prop={'family': font_family, 'size': legend_size})
     plt.grid(True, linestyle='--', alpha=0.3)
 
     img_name = f'tsne_fold_{fold_idx}.png'
     plt.savefig(os.path.join(save_path, img_name))
     plt.close()
+
 
 def plot_mean_std_conf_matrix(cm_list, save_path):
     """
@@ -48,7 +69,6 @@ def plot_mean_std_conf_matrix(cm_list, save_path):
     cm_std = np.std(cms, axis=0)
 
     # 构建显示在方格里的文字标签 (Mean ± Std)
-    # 也可以选择只显示百分比，或者 Mean(Std)
     annot = np.empty_like(cm_mean).astype(str)
     rows, cols = cm_mean.shape
     for r in range(rows):
@@ -56,11 +76,35 @@ def plot_mean_std_conf_matrix(cm_list, save_path):
             annot[r, c] = f"{cm_mean[r, c]:.2f}\n±{cm_std[r, c]:.2f}"
 
     plt.figure(figsize=(8, 6))
-    sns.heatmap(cm_mean, annot=annot, fmt="", cmap='Blues',
-                xticklabels=['ADHD', 'HC'], yticklabels=['ADHD', 'HC'])
-    plt.xlabel('Predicted')
-    plt.ylabel('Actual')
-    plt.title('Average Confusion Matrix (Mean ± Std)')
+
+    # --- 从字典读取配置 ---
+    font_family = PLOT_FONT_CONFIG['family']
+    annot_size = PLOT_FONT_CONFIG['annot_size']
+    axis_label_size = PLOT_FONT_CONFIG['axis_label_size']
+    tick_size = PLOT_FONT_CONFIG['tick_label_size']
+
+    # 调整混淆矩阵内部图上的数字字体样式和大小
+    ax = sns.heatmap(cm_mean, annot=annot, fmt="", cmap='Blues',
+                     xticklabels=['ADHD', 'HC'], yticklabels=['ADHD', 'HC'],
+                     annot_kws={"family": font_family, "size": annot_size})
+
+    # 设置坐标轴标签的字体
+    plt.xlabel('Predicted', fontdict={'family': font_family, 'size': axis_label_size})
+    plt.ylabel('Actual', fontdict={'family': font_family, 'size': axis_label_size})
+
+    # 设置 XY 刻度标签 ('ADHD', 'HC') 的字体
+    plt.xticks(fontname=font_family, fontsize=tick_size)
+    plt.yticks(fontname=font_family, fontsize=tick_size)
+
+    # 获取热力图自带的 Colorbar 并修改上面数字的字体
+    cbar = ax.collections[0].colorbar
+    cbar.ax.tick_params(labelsize=tick_size)  # 修改 Colorbar 数字大小
+    for tick in cbar.ax.get_yticklabels():
+        tick.set_fontname(font_family)  # 修改 Colorbar 数字字体
+
+    # 删除标题 (已注释)
+    # plt.title('Average Confusion Matrix (Mean ± Std)')
+
     plt.savefig(os.path.join(save_path, 'cm_mean_std.png'))
     plt.close()
 
