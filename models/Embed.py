@@ -49,6 +49,15 @@ class CustomPatchEmbedding(nn.Module):
                 (5, 3, 0, 3),  # Middle: h=5, w=3, y=0, x=3~6
                 (5, 3, 0, 6)  # Right:  h=5, w=3, y=0, x=6~9
             ]
+
+        elif roi_mode == 'grid_1x3':
+            # 策略五：将 5x9 网格划分为 15 个 1x3 的小网格 (共15个Patch)
+            self.patch_definitions = []
+            for row in range(5):  # y 坐标: 0 到 4
+                for col_idx in range(3):  # x 坐标被分为3段: 0~2, 3~5, 6~8
+                    # 格式: (h, w, y_start, x_start)
+                    self.patch_definitions.append((1, 3, row, col_idx * 3))
+
         else:
             raise ValueError(f"Unknown roi_mode: {roi_mode}")
 

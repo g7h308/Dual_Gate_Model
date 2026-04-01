@@ -160,8 +160,9 @@ def get_args():
     parser.add_argument('--save_dir', type=str, default='./checkpoints')
     parser.add_argument('--exp_name', type=str, default='dual_branch')
     parser.add_argument('--k_folds', type=int, default=5)
-    parser.add_argument('--roi_mode',type=str, default='original',choices=('original', 'full', 'hemi_4_5', 'hemi_5_4','three_columns'),
-                        help='original:6脑区，full：不划分  hemi_4_5:左脑4右脑5  three_columns:三等分')
+    parser.add_argument('--roi_mode', type=str, default='original',
+                        choices=('original', 'full', 'hemi_4_5', 'hemi_5_4', 'three_columns', 'grid_1x3'),
+                        help='original:6脑区，full：不划分  hemi_4_5:左脑4右脑5  three_columns:三等分，grid_1x3: 15个1x3大小的网格...')
     parser.add_argument('--keep_ratio', type=float, default=1.0, help='保留因果矩阵中最强连接的比例 (Top-K)')
 
     parser.add_argument('--special note',type=str,default='')
@@ -200,15 +201,40 @@ def main():
         X_chan_dxy_all = np.delete(X_chan_dxy_all, 0, axis=2)
 
         # 定义你提供的 ROI 映射
-        roi_mapping = [
-            [0, 4, 5],  # ROI 0
-            [1, 2],  # ROI 1
-            [3, 7, 8],  # ROI 2
-            [9, 13, 14, 18],  # ROI 3
-            [6, 10, 11, 15, 19, 20],  # ROI 4
-            [12, 16, 17, 21]  # ROI 5
-        ]
+        # 将原始通道精确映射到 15 个 1x3 的 ROI 中
+        # 网格坐标系: row 0~4, col 0~8
+        if args.roi_mode == 'grid_1x3':
+            roi_mapping = [
+                [0],  # ROI 0  (y=0, x=0~2): 包含通道 0
+                [1, 2],  # ROI 1  (y=0, x=3~5): 包含通道 1, 2
+                [3],  # ROI 2  (y=0, x=6~8): 包含通道 3
 
+                [4, 5],  # ROI 3  (y=1, x=0~2): 包含通道 4, 5
+                [6],  # ROI 4  (y=1, x=3~5): 包含通道 6
+                [7, 8],  # ROI 5  (y=1, x=6~8): 包含通道 7, 8
+
+                [9],  # ROI 6  (y=2, x=0~2): 包含通道 9
+                [10, 11],  # ROI 7  (y=2, x=3~5): 包含通道 10, 11
+                [12],  # ROI 8  (y=2, x=6~8): 包含通道 12
+
+                [13, 14],  # ROI 9  (y=3, x=0~2): 包含通道 13, 14
+                [15],  # ROI 10 (y=3, x=3~5): 包含通道 15
+                [16, 17],  # ROI 11 (y=3, x=6~8): 包含通道 16, 17
+
+                [18],  # ROI 12 (y=4, x=0~2): 包含通道 18
+                [19, 20],  # ROI 13 (y=4, x=3~5): 包含通道 19, 20
+                [21]  # ROI 14 (y=4, x=6~8): 包含通道 21
+            ]
+        else:
+            # 兼容原有的映射逻辑
+            roi_mapping = [
+                [0, 4, 5],  # ROI 0
+                [1, 2],  # ROI 1
+                [3, 7, 8],  # ROI 2
+                [9, 13, 14, 18],  # ROI 3
+                [6, 10, 11, 15, 19, 20],  # ROI 4
+                [12, 16, 17, 21]  # ROI 5
+            ]
 
         logger.info(f"Loaded raw data. Total subjects: {len(y_all)}")
 
@@ -218,6 +244,53 @@ def main():
         fold_final_metrics = []
         all_fold_cms = []  # 新增：用于收集每一折的矩阵
         device = torch.device(args.device)
+
+        # ==============================================================================
+        # >>> 新增：仅用于观察分析，基于【全体数据】计算并打印全局因果先验图 <<<
+        # ==============================================================================
+        logger.info("\n>>> 开始基于全体数据计算全局 Oxy 和 Dxy 因果先验 (仅供观察分析)...")
+
+        # 使用全体标签生成全局 Mask
+        all_adhd_mask = (y_all == 0)
+        all_hc_mask = (y_all == 1)
+
+        # 1. ====== 观察全局 Oxy 因果矩阵 ======
+        global_A_causal_oxy_adhd = compute_causal_prior_from_channels(
+            fnirs_channel_data=X_chan_oxy_all[all_adhd_mask], roi_mapping=roi_mapping
+        )
+        global_A_causal_oxy_hc = compute_causal_prior_from_channels(
+            fnirs_channel_data=X_chan_oxy_all[all_hc_mask], roi_mapping=roi_mapping
+        )
+
+        # 计算并打印 Oxy 的 3 张全局图
+        global_binary_A_causal_oxy_adhd = (global_A_causal_oxy_adhd != 0).any(dim=2).float()
+        global_binary_A_causal_oxy_hc = (global_A_causal_oxy_hc != 0).any(dim=2).float()
+        global_binary_A_causal_oxy = (
+                    global_binary_A_causal_oxy_adhd.bool() | global_binary_A_causal_oxy_hc.bool()).float()
+
+        logger.info(f"【全局观察】binary_A_causal_oxy_adhd: \n{global_binary_A_causal_oxy_adhd}")
+        logger.info(f"【全局观察】binary_A_causal_oxy_hc: \n{global_binary_A_causal_oxy_hc}")
+        logger.info(f"【全局观察】binary_A_causal_oxy (并集): \n{global_binary_A_causal_oxy}")
+
+        # 2. ====== 观察全局 Dxy 因果矩阵 ======
+        global_A_causal_dxy_adhd = compute_causal_prior_from_channels(
+            fnirs_channel_data=X_chan_dxy_all[all_adhd_mask], roi_mapping=roi_mapping
+        )
+        global_A_causal_dxy_hc = compute_causal_prior_from_channels(
+            fnirs_channel_data=X_chan_dxy_all[all_hc_mask], roi_mapping=roi_mapping
+        )
+
+        # 计算并打印 Dxy 的 3 张全局图
+        global_binary_A_causal_dxy_adhd = (global_A_causal_dxy_adhd != 0).any(dim=2).float()
+        global_binary_A_causal_dxy_hc = (global_A_causal_dxy_hc != 0).any(dim=2).float()
+        global_binary_A_causal_dxy = (
+                    global_binary_A_causal_dxy_adhd.bool() | global_binary_A_causal_dxy_hc.bool()).float()
+
+        logger.info(f"【全局观察】binary_A_causal_dxy_adhd: \n{global_binary_A_causal_dxy_adhd}")
+        logger.info(f"【全局观察】binary_A_causal_dxy_hc: \n{global_binary_A_causal_dxy_hc}")
+        logger.info(f"【全局观察】binary_A_causal_dxy (并集): \n{global_binary_A_causal_dxy}")
+
+        logger.info(">>> 全局因果先验图打印完毕，开始进行五折交叉验证...\n")
 
         # 3. K-Fold 循环
         # split 的输入是 range(N_subjects)，保证同一个人的数据要么都在训练，要么都在验证
