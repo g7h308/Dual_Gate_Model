@@ -164,6 +164,7 @@ def get_args():
                         choices=('original', 'full', 'hemi_4_5', 'hemi_5_4', 'three_columns', 'grid_1x3'),
                         help='original:6脑区，full：不划分  hemi_4_5:左脑4右脑5  three_columns:三等分，grid_1x3: 15个1x3大小的网格...')
     parser.add_argument('--keep_ratio', type=float, default=1.0, help='保留因果矩阵中最强连接的比例 (Top-K)')
+    parser.add_argument('--chunk_size',type=int, default=10, help='滑动窗口大小')
 
     parser.add_argument('--special note',type=str,default='')
     return parser.parse_args()
@@ -388,7 +389,8 @@ def main():
                 drop=args.dropout,
                 attn_drop=args.attn_drop,
                 roi_mode=args.roi_mode,
-                keep_ratio=args.keep_ratio
+                keep_ratio=args.keep_ratio,
+                chunk_size=args.chunk_size
             ).to(device)
 
             criterion = nn.CrossEntropyLoss()
