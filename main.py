@@ -8,6 +8,7 @@ import sys
 import datetime  # 新增
 import shutil  # 新增：用于删除文件夹
 import matplotlib.pyplot as plt
+from h5py.h5z import FLAG_SKIP_EDC
 from torch.nn.functional import dropout
 from torch.utils.data import DataLoader
 from sklearn.model_selection import KFold
@@ -143,16 +144,16 @@ def get_args():
     parser.add_argument('--data_path', type=str, default='./data/VFT')
     parser.add_argument('--num_classes', type=int, default=2)
     parser.add_argument('--num_workers', type=int, default=0)
-    parser.add_argument('--hidden_dims', type=int, default=64)
-    parser.add_argument('--head', type=int, default=2)
-    parser.add_argument('--depth', type=int, default=1)
-    parser.add_argument('--k_memory', type=int, default=10)
+    parser.add_argument('--hidden_dims', type=int, default=64,help='隐藏向量维度')
+    parser.add_argument('--head', type=int, default=2,help='头数')
+    parser.add_argument('--depth', type=int, default=1,help='深度')
+    parser.add_argument('--k_memory', type=int, default=10,help='记忆池长度')
     parser.add_argument('--dropout',type=float,default=0.4)
-    parser.add_argument('--attn_drop',type=float,default=0.4)
+    parser.add_argument('--attn_drop',type=float,default=0.4,help='注意力drop比例')
     parser.add_argument('--epochs', type=int, default=100)
     parser.add_argument('--batch_size', type=int, default=16)
     parser.add_argument('--lr', type=float, default=5e-4)
-    parser.add_argument('--weight_decay', type=float, default=1e-2)
+    parser.add_argument('--weight_decay', type=float, default=1e-2,help='l2正则化系数')
     parser.add_argument('--patience', type=int, default=10)
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--optim_patience', type=int, default=5,help='每隔optim_patience轮lr减半')
@@ -165,6 +166,8 @@ def get_args():
                         help='original:6脑区，full：不划分  hemi_4_5:左脑4右脑5  three_columns:三等分，grid_1x3: 15个1x3大小的网格...')
     parser.add_argument('--keep_ratio', type=float, default=1.0, help='保留因果矩阵中最强连接的比例 (Top-K)')
     parser.add_argument('--chunk_size',type=int, default=10, help='滑动窗口大小')
+
+    parser.add_argument('--disable_causal', type=bool,default=False, help='是否消融因果先验图（即不使用因果掩码，退化为全注意力）')
 
     parser.add_argument('--special note',type=str,default='')
     return parser.parse_args()
@@ -308,59 +311,62 @@ def main():
             X_val_dxy_raw = X_dxy_all[val_idx]
             y_val_raw = y_all[val_idx]
 
+            if not args.disable_causal:
+                logger.info(">>> 开始计算当前折的 Oxy 和 Dxy 因果先验...")
+                X_train_chan_oxy = X_chan_oxy_all[train_idx]
+                X_train_chan_dxy = X_chan_dxy_all[train_idx]
 
-            logger.info(">>> 开始计算当前折的 Oxy 和 Dxy 因果先验...")
-            X_train_chan_oxy = X_chan_oxy_all[train_idx]
-            X_train_chan_dxy = X_chan_dxy_all[train_idx]
+                train_adhd_mask = (y_train_raw == 0)
+                train_hc_mask = (y_train_raw == 1)
 
-            train_adhd_mask = (y_train_raw == 0)
-            train_hc_mask = (y_train_raw == 1)
+                # 2. ====== 处理 Oxy 因果矩阵 ======
+                # 分别计算 ADHD 和 HC 的 Oxy 矩阵
+                A_causal_oxy_adhd = compute_causal_prior_from_channels(
+                    fnirs_channel_data=X_train_chan_oxy[train_adhd_mask], roi_mapping=roi_mapping
+                ).to(device)
 
-            # 2. ====== 处理 Oxy 因果矩阵 ======
-            # 分别计算 ADHD 和 HC 的 Oxy 矩阵
-            A_causal_oxy_adhd = compute_causal_prior_from_channels(
-                fnirs_channel_data=X_train_chan_oxy[train_adhd_mask], roi_mapping=roi_mapping
-            ).to(device)
+                A_causal_oxy_hc = compute_causal_prior_from_channels(
+                    fnirs_channel_data=X_train_chan_oxy[train_hc_mask], roi_mapping=roi_mapping
+                ).to(device)
 
-            A_causal_oxy_hc = compute_causal_prior_from_channels(
-                fnirs_channel_data=X_train_chan_oxy[train_hc_mask], roi_mapping=roi_mapping
-            ).to(device)
-
-            # 取并集：只要 ADHD 或 HC 中存在非 0 的连接，我们就给它赋值为 1.0，否则为 0.0
-            A_causal_oxy = torch.where((A_causal_oxy_adhd != 0) | (A_causal_oxy_hc != 0), 1.0, 0.0)
+                # 取并集：只要 ADHD 或 HC 中存在非 0 的连接，我们就给它赋值为 1.0，否则为 0.0
+                A_causal_oxy = torch.where((A_causal_oxy_adhd != 0) | (A_causal_oxy_hc != 0), 1.0, 0.0)
 
 
-            binary_A_causal_oxy_adhd = (A_causal_oxy_adhd != 0).any(dim=2).float()
-            binary_A_causal_oxy_hc = (A_causal_oxy_hc != 0).any(dim=2).float()
-            logger.info(f"binary_A_causal_oxy_adhd): \n{binary_A_causal_oxy_adhd}")
-            logger.info(f"binary_A_causal_oxy_hc): \n{binary_A_causal_oxy_hc}")
-            binary_A_causal_oxy = (binary_A_causal_oxy_adhd.bool() | binary_A_causal_oxy_hc.bool()).float()
-            logger.info(f"binary_A_causal_oxy): \n{binary_A_causal_oxy}")
+                binary_A_causal_oxy_adhd = (A_causal_oxy_adhd != 0).any(dim=2).float()
+                binary_A_causal_oxy_hc = (A_causal_oxy_hc != 0).any(dim=2).float()
+                logger.info(f"binary_A_causal_oxy_adhd): \n{binary_A_causal_oxy_adhd}")
+                logger.info(f"binary_A_causal_oxy_hc): \n{binary_A_causal_oxy_hc}")
+                binary_A_causal_oxy = (binary_A_causal_oxy_adhd.bool() | binary_A_causal_oxy_hc.bool()).float()
+                logger.info(f"binary_A_causal_oxy): \n{binary_A_causal_oxy}")
 
-            # 3. ====== 处理 Dxy 因果矩阵 ======
-            # 分别计算 ADHD 和 HC 的 Dxy 矩阵
-            A_causal_dxy_adhd = compute_causal_prior_from_channels(
-                fnirs_channel_data=X_train_chan_dxy[train_adhd_mask], roi_mapping=roi_mapping
-            ).to(device)
+                # 3. ====== 处理 Dxy 因果矩阵 ======
+                # 分别计算 ADHD 和 HC 的 Dxy 矩阵
+                A_causal_dxy_adhd = compute_causal_prior_from_channels(
+                    fnirs_channel_data=X_train_chan_dxy[train_adhd_mask], roi_mapping=roi_mapping
+                ).to(device)
 
-            A_causal_dxy_hc = compute_causal_prior_from_channels(
-                fnirs_channel_data=X_train_chan_dxy[train_hc_mask], roi_mapping=roi_mapping
-            ).to(device)
+                A_causal_dxy_hc = compute_causal_prior_from_channels(
+                    fnirs_channel_data=X_train_chan_dxy[train_hc_mask], roi_mapping=roi_mapping
+                ).to(device)
 
-            # 取并集
-            A_causal_dxy = torch.where((A_causal_dxy_adhd != 0) | (A_causal_dxy_hc != 0), 1.0, 0.0)
+                # 取并集
+                A_causal_dxy = torch.where((A_causal_dxy_adhd != 0) | (A_causal_dxy_hc != 0), 1.0, 0.0)
 
-            binary_A_causal_dxy_adhd = (A_causal_dxy_adhd != 0).any(dim=2).float()
-            binary_A_causal_dxy_hc = (A_causal_dxy_hc != 0).any(dim=2).float()
-            logger.info(f"binary_A_causal_dxy_adhd): \n{binary_A_causal_dxy_adhd}")
-            logger.info(f"binary_A_causal_dxy_hc): \n{binary_A_causal_dxy_hc}")
-            binary_A_causal_dxy = (binary_A_causal_dxy_adhd.bool() | binary_A_causal_dxy_hc.bool()).float()
-            logger.info(f"binary_A_causal_dxy): \n{binary_A_causal_dxy}")
+                binary_A_causal_dxy_adhd = (A_causal_dxy_adhd != 0).any(dim=2).float()
+                binary_A_causal_dxy_hc = (A_causal_dxy_hc != 0).any(dim=2).float()
+                logger.info(f"binary_A_causal_dxy_adhd): \n{binary_A_causal_dxy_adhd}")
+                logger.info(f"binary_A_causal_dxy_hc): \n{binary_A_causal_dxy_hc}")
+                binary_A_causal_dxy = (binary_A_causal_dxy_adhd.bool() | binary_A_causal_dxy_hc.bool()).float()
+                logger.info(f"binary_A_causal_dxy): \n{binary_A_causal_dxy}")
 
-            logger.info(">>> 双因果先验（ADHD与HC并集）计算完成！")
+                logger.info(">>> 双因果先验（ADHD与HC并集）计算完成！")
 
-            # print(A_causal_dxy)
-            # print(A_causal_oxy)
+            else:
+                logger.info(">>> [消融实验] 已禁用因果先验图，模型将退化为全空间注意力机制！")
+                # 传入 None，TimeSformer 的 attn_mask 就会接收 None，从而不遮掩任何注意力
+                A_causal_oxy = None
+                A_causal_dxy = None
 
             # --- 关键步骤：然后在各自集合内独立进行扩充 ---
             # 这样 Train 里的扩充样本只来自 Train Subject，Val 同理
