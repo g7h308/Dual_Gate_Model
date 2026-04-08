@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
 from .TemporalFusionModule import TemporalFusionModule
 from .Timesformer import TimeSformerBlock, BIE, BIE_Concat, ConvBlock
 # 引入之前写好的 Embedding 模块
@@ -14,9 +15,15 @@ class DualBranchRecurrentModel(nn.Module):
                  depth=3,
                  k_memory=20,
                  num_classes=2,
-                 chunk_size=10,drop=0.,attn_drop=0.,roi_mode='original', keep_ratio=0.4):  # 新增 chunk_size，对应 TimeSformer 的时间窗口
+                 chunk_size=10,
+                 drop=0.,
+                 attn_drop=0.,
+                 roi_mode='original',
+                 keep_ratio=0.4,
+                 edl_mode=False):  # 新增 chunk_size，对应 TimeSformer 的时间窗口
         super().__init__()
 
+        self.edl_mode = edl_mode
         self.depth = depth
         self.chunk_size = chunk_size
         self.embed_dim = embed_dim
@@ -165,9 +172,14 @@ class DualBranchRecurrentModel(nn.Module):
         # 分类
         logits = self.classifier(combined_feat)
 
+        if self.edl_mode:
+            # EDL模式下，将 logits 通过 softplus 转换为非负的证据(Evidence)
+            output = F.softplus(logits)
+        else:
+            output = logits
         if return_features:
-            return logits, combined_feat  # 同时返回预测结果和高维特征
-        return logits
+            return output, combined_feat  # 同时返回预测结果和高维特征
+        return output
 
 
 # ==========================================

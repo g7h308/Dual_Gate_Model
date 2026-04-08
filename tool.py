@@ -9,6 +9,13 @@ import random
 import json
 
 from sklearn.manifold import TSNE
+# ==========================================
+# 新增: EDL 工具函数 (放置在 tool.py 末尾)
+# ==========================================
+import torch.nn.functional as F
+import pandas as pd
+
+
 
 PLOT_FONT_CONFIG = {
     'family': 'Times New Roman',  # 统一字体样式：新罗马
@@ -255,3 +262,73 @@ class EarlyStopping:
 
     def save_checkpoint(self, model):
         torch.save(model.state_dict(), self.path)
+
+
+
+
+def softplus_evidence(y):
+    return F.softplus(y)
+
+
+def kl_divergence(alpha, num_classes, device):
+    ones = torch.ones([1, num_classes], dtype=torch.float32, device=device)
+    sum_alpha = torch.sum(alpha, dim=1, keepdim=True)
+    first_term = (
+            torch.lgamma(sum_alpha)
+            - torch.lgamma(alpha).sum(dim=1, keepdim=True)
+            + torch.lgamma(ones).sum(dim=1, keepdim=True)
+            - torch.lgamma(ones.sum(dim=1, keepdim=True))
+    )
+    second_term = (
+        (alpha - ones)
+        .mul(torch.digamma(alpha) - torch.digamma(sum_alpha))
+        .sum(dim=1, keepdim=True)
+    )
+    kl = first_term + second_term
+    return kl
+
+
+def edl_mse_loss(func, y, alpha, epoch_num, num_classes, annealing_step, device):
+    """EDL 的均方误差损失 + KL 散度退火"""
+    y = y.to(device)
+    alpha = alpha.to(device)
+    S = torch.sum(alpha, dim=1, keepdim=True)
+
+    # 期望概率的均方误差
+    A = torch.sum((y - (alpha / S)) ** 2, dim=1, keepdim=True)
+    # 预测方差
+    B = torch.sum(alpha * (S - alpha) / (S * S * (S + 1)), dim=1, keepdim=True)
+
+    # KL 散度退火系数
+    annealing_coef = torch.min(
+        torch.tensor(1.0, dtype=torch.float32),
+        torch.tensor(epoch_num / annealing_step, dtype=torch.float32),
+    )
+
+    alpha_tilde = y + (1 - y) * alpha
+    KL = kl_divergence(alpha_tilde, num_classes, device=device)
+
+    loss = (A + B) + annealing_coef * KL
+    return loss.mean()
+
+
+def plot_edl_scatter(b_list, u_list, save_path):
+    """绘制 ADHD 样本的 Belief - Uncertainty 散点图"""
+    plt.figure(figsize=(8, 6))
+
+    # 使用红色散点表示 ADHD，大小适中，带白色边缘
+    plt.scatter(b_list, u_list, c='#D62728', alpha=0.7, edgecolors='white', s=80, label='ADHD Samples')
+
+    font_family = PLOT_FONT_CONFIG['family']
+    plt.xlabel('Belief (b)', fontdict={'family': font_family, 'size': PLOT_FONT_CONFIG['axis_label_size']})
+    plt.ylabel('Uncertainty (u)', fontdict={'family': font_family, 'size': PLOT_FONT_CONFIG['axis_label_size']})
+
+    plt.xticks(fontname=font_family, fontsize=PLOT_FONT_CONFIG['tick_label_size'])
+    plt.yticks(fontname=font_family, fontsize=PLOT_FONT_CONFIG['tick_label_size'])
+
+    plt.legend(prop={'family': font_family, 'size': PLOT_FONT_CONFIG['legend_size']})
+    plt.grid(True, linestyle='--', alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_path, 'adhd_edl_scatter.png'), dpi=300)
+    plt.close()

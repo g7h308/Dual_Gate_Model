@@ -22,10 +22,12 @@ from torch.nn.functional import dropout, softmax # 引入 softmax 计算概率
 
 from PCMCI import compute_causal_prior_from_channels
 
-from tool import plot_mean_std_conf_matrix, set_seed, get_logger, close_logger, log_hyperparameters, plot_loss_curve, EarlyStopping, plot_tsne
+from tool import (plot_mean_std_conf_matrix, set_seed, get_logger, close_logger,
+                  log_hyperparameters, plot_loss_curve, EarlyStopping, plot_tsne,
+                  edl_mse_loss, softplus_evidence, plot_edl_scatter) # <--- 新增 EDL 工具
+import pandas as pd # <--- 记得导入 pandas 用于保存 csv
 
-
-
+import torch.nn.functional as F
 
 
 
@@ -55,7 +57,8 @@ def calculate_metrics(all_labels, all_preds, all_probs):
 # ==========================================
 # 4. 训练与评估
 # ==========================================
-def train_one_epoch(model, loader, criterion, optimizer, device, A_causal_oxy, A_causal_dxy):
+# 将 train_one_epoch 的参数增加 epoch 和 args，并修改内部 Loss 计算
+def train_one_epoch(model, loader, criterion, optimizer, device, A_causal_oxy, A_causal_dxy, epoch, args):
     model.train()
     running_loss = 0.0
     all_labels = []
@@ -65,14 +68,29 @@ def train_one_epoch(model, loader, criterion, optimizer, device, A_causal_oxy, A
     for oxy, dxy, labels in loader:
         oxy, dxy, labels = oxy.to(device), dxy.to(device), labels.to(device)
         optimizer.zero_grad()
-        outputs = model(oxy, dxy, A_causal_oxy,A_causal_dxy)
-        loss = criterion(outputs, labels)
+        outputs = model(oxy, dxy, A_causal_oxy, A_causal_dxy)
+
+        # === 根据 EDL 模式切换计算逻辑 ===
+        if args.edl_mode:
+            evidence = outputs
+            alpha = evidence + 1
+            S = torch.sum(alpha, dim=1, keepdim=True)
+            probs = alpha / S
+
+            y_one_hot = F.one_hot(labels, num_classes=args.num_classes).float()
+            loss = edl_mse_loss(softplus_evidence, y_one_hot, alpha, epoch, args.num_classes, args.annealing_step,
+                                device)
+            _, predicted = torch.max(probs, 1)
+        else:
+            loss = criterion(outputs, labels)
+            probs = softmax(outputs, dim=1)
+            _, predicted = outputs.max(1)
+        # ================================
+
         loss.backward()
         optimizer.step()
 
         running_loss += loss.item() * labels.size(0)
-        probs = softmax(outputs, dim=1)
-        _, predicted = outputs.max(1)
 
         all_labels.extend(labels.cpu().numpy())
         all_preds.extend(predicted.cpu().numpy())
@@ -82,23 +100,32 @@ def train_one_epoch(model, loader, criterion, optimizer, device, A_causal_oxy, A
     return running_loss / len(loader.dataset), metrics
 
 
-def evaluate(model, loader, criterion, device, A_causal_oxy, A_causal_dxy):
+def evaluate(model, loader, criterion, device, A_causal_oxy, A_causal_dxy, args):
     model.eval()
     running_loss = 0.0
-    all_labels = []
-    all_preds = []
-    all_probs = []
+    all_labels, all_preds, all_probs = [], [], []
 
     with torch.no_grad():
         for oxy, dxy, labels in loader:
             oxy, dxy, labels = oxy.to(device), dxy.to(device), labels.to(device)
             outputs = model(oxy, dxy, A_causal_oxy, A_causal_dxy)
-            loss = criterion(outputs, labels)
+
+            if args.edl_mode:
+                evidence = outputs
+                alpha = evidence + 1
+                S = torch.sum(alpha, dim=1, keepdim=True)
+                probs = alpha / S
+
+                y_one_hot = F.one_hot(labels, num_classes=args.num_classes).float()
+                loss = edl_mse_loss(softplus_evidence, y_one_hot, alpha, args.annealing_step, args.num_classes,
+                                    args.annealing_step, device)
+                _, predicted = torch.max(probs, 1)
+            else:
+                loss = criterion(outputs, labels)
+                probs = softmax(outputs, dim=1)
+                _, predicted = outputs.max(1)
+
             running_loss += loss.item() * labels.size(0)
-
-            probs = softmax(outputs, dim=1)
-            _, predicted = outputs.max(1)
-
             all_labels.extend(labels.cpu().numpy())
             all_preds.extend(predicted.cpu().numpy())
             all_probs.extend(probs.cpu().numpy())
@@ -107,34 +134,53 @@ def evaluate(model, loader, criterion, device, A_causal_oxy, A_causal_dxy):
     return running_loss / len(loader.dataset), metrics
 
 
-def evaluate_with_features(model, loader, criterion, device, A_causal_oxy, A_causal_dxy):
+def evaluate_with_features(model, loader, criterion, device, A_causal_oxy, A_causal_dxy, args):
     model.eval()
     running_loss = 0.0
-    all_labels = []
-    all_preds = []
-    all_probs = []
-    all_features = []  # 新增：用于存储特征
+    all_labels, all_preds, all_probs, all_features = [], [], [], []
+
+    # 新增用于收集 EDL 指标
+    all_b, all_u, all_P = [], [], []
 
     with torch.no_grad():
         for oxy, dxy, labels in loader:
             oxy, dxy, labels = oxy.to(device), dxy.to(device), labels.to(device)
-            # 调用修改后的 forward
             outputs, features = model(oxy, dxy, A_causal_oxy, A_causal_dxy, return_features=True)
 
-            loss = criterion(outputs, labels)
+            if args.edl_mode:
+                evidence = outputs
+                alpha = evidence + 1
+                S = torch.sum(alpha, dim=1, keepdim=True)
+                probs = alpha / S
+
+                # 计算 b, u, P
+                max_probs, predicted = torch.max(probs, 1)  # 期望概率 P
+                uncertainty = args.num_classes / S  # 不确定性 u
+                belief = evidence / S
+                pred_beliefs = torch.gather(belief, 1, predicted.unsqueeze(1)).squeeze(1)  # 预测类的信任度 b
+
+                # 存入列表
+                all_b.extend(pred_beliefs.cpu().numpy().flatten())
+                all_u.extend(uncertainty.cpu().numpy().flatten())
+                all_P.extend(max_probs.cpu().numpy().flatten())
+
+                y_one_hot = F.one_hot(labels, num_classes=args.num_classes).float()
+                loss = edl_mse_loss(softplus_evidence, y_one_hot, alpha, args.annealing_step, args.num_classes,
+                                    args.annealing_step, device)
+            else:
+                loss = criterion(outputs, labels)
+                probs = softmax(outputs, dim=1)
+                _, predicted = outputs.max(1)
+
             running_loss += loss.item() * labels.size(0)
-
-            probs = softmax(outputs, dim=1)
-            _, predicted = outputs.max(1)
-
             all_labels.extend(labels.cpu().numpy())
             all_preds.extend(predicted.cpu().numpy())
             all_probs.extend(probs.cpu().numpy())
-            all_features.extend(features.cpu().numpy())  # 收集特征
+            all_features.extend(features.cpu().numpy())
 
     metrics = calculate_metrics(np.array(all_labels), np.array(all_preds), np.array(all_probs))
-    return running_loss / len(loader.dataset), metrics, np.array(all_features), np.array(all_labels)
-
+    return running_loss / len(loader.dataset), metrics, np.array(all_features), np.array(
+        all_labels), all_b, all_u, all_P
 # ==========================================
 # 5. 主函数 (核心修改部分)
 # ==========================================
@@ -155,7 +201,7 @@ def get_args():
     parser.add_argument('--lr', type=float, default=5e-4)
     parser.add_argument('--weight_decay', type=float, default=1e-2,help='l2正则化系数')
     parser.add_argument('--patience', type=int, default=10)
-    parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--optim_patience', type=int, default=5,help='每隔optim_patience轮lr减半')
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
     parser.add_argument('--save_dir', type=str, default='./checkpoints')
@@ -168,6 +214,9 @@ def get_args():
     parser.add_argument('--chunk_size',type=int, default=10, help='滑动窗口大小')
 
     parser.add_argument('--disable_causal', type=bool,default=False, help='是否消融因果先验图（即不使用因果掩码，退化为全注意力）')
+
+    parser.add_argument('--edl_mode', type=lambda x: (str(x).lower() == 'true'), default=True, help='是否开启 EDL 模式')
+    parser.add_argument('--annealing_step', type=int, default=10, help='EDL中KL散度退火的Epoch数')
 
     parser.add_argument('--special note',type=str,default='')
     return parser.parse_args()
@@ -296,6 +345,8 @@ def main():
 
         logger.info(">>> 全局因果先验图打印完毕，开始进行五折交叉验证...\n")
 
+        global_adhd_b = []
+        global_adhd_u = []
         # 3. K-Fold 循环
         # split 的输入是 range(N_subjects)，保证同一个人的数据要么都在训练，要么都在验证
         for fold, (train_idx, val_idx) in enumerate(kfold.split(X_oxy_all)):
@@ -396,7 +447,8 @@ def main():
                 attn_drop=args.attn_drop,
                 roi_mode=args.roi_mode,
                 keep_ratio=args.keep_ratio,
-                chunk_size=args.chunk_size
+                chunk_size=args.chunk_size,
+                edl_mode=args.edl_mode
             ).to(device)
 
             criterion = nn.CrossEntropyLoss()
@@ -413,8 +465,8 @@ def main():
             # --- 训练 ---
             for epoch in range(args.epochs):
                 train_loss, t_m = train_one_epoch(model, train_loader, criterion, optimizer, device, A_causal_oxy,
-                                                  A_causal_dxy)
-                val_loss, v_m = evaluate(model, val_loader, criterion, device, A_causal_oxy, A_causal_dxy)
+                                                  A_causal_dxy, epoch, args)
+                val_loss, v_m = evaluate(model, val_loader, criterion, device, A_causal_oxy, A_causal_dxy, args)
                 train_losses.append(train_loss)
                 val_losses.append(val_loss)
 
@@ -433,16 +485,41 @@ def main():
             # --- 验证 ---
             if os.path.exists(best_model_path):
                 model.load_state_dict(torch.load(best_model_path))
-                f_loss, f_m, val_features, val_labels = evaluate_with_features(model, val_loader, criterion, device, A_causal_oxy, A_causal_dxy)
+                f_loss, f_m, val_features, val_labels, val_b, val_u, val_P = evaluate_with_features(model, val_loader, criterion, device, A_causal_oxy, A_causal_dxy, args)
                 plot_tsne(val_features, val_labels, temp_save_path, fold + 1)
 
                 logger.info(f"Fold {fold + 1} t-SNE plot saved.")
+
+                if args.edl_mode:
+                    # 满足要求 2：打印每一折最优模型的所有样本的平均 b, u, P
+                    mean_b = np.mean(val_b)
+                    mean_u = np.mean(val_u)
+                    mean_P = np.mean(val_P)
+                    logger.info(
+                        f"Fold {fold + 1} Best Model EDL Metrics -> Mean b: {mean_b:.4f}, Mean u: {mean_u:.4f}, Mean Expected P: {mean_P:.4f}")
+
+                    # 满足要求 3：每一折最优模型的每一个样本的 b, u, P 都要保存下来
+                    df_metrics = pd.DataFrame({
+                        'True_Label': val_labels,
+                        'Belief_b': val_b,
+                        'Uncertainty_u': val_u,
+                        'Expected_Prob_P': val_P
+                    })
+                    csv_name = os.path.join(temp_save_path, f'fold_{fold + 1}_edl_samples.csv')
+                    df_metrics.to_csv(csv_name, index=False)
+                    logger.info(f"Fold {fold + 1} 单个样本的 EDL 指标已保存至 CSV: {csv_name}")
+
+                    # 满足要求 4（收集步骤）：把属于 ADHD (Label==0) 的样本追加到全局列表里
+                    for lbl, b_val, u_val in zip(val_labels, val_b, val_u):
+                        if lbl == 0:  # 假设 0 是 ADHD
+                            global_adhd_b.append(b_val)
+                            global_adhd_u.append(u_val)
+                    # ==========================================================
 
                 fold_final_metrics.append(f_m)
                 all_fold_cms.append(f_m['cm'])
                 logger.info(
                     f"Fold {fold + 1} BEST Result -> Acc: {f_m['acc']:.4f}, Pre: {f_m['precision']:.4f}, Rec: {f_m['recall']:.4f}, F1: {f_m['f1']:.4f}, AUC: {f_m['auc']:.4f}")
-                fold_final_metrics.append(f_m)
             else:
                 fold_final_metrics.append({"acc": 0, "precision": 0, "recall": 0, "f1": 0, "auc": 0})
 
@@ -451,6 +528,11 @@ def main():
         # 1. 调用绘图函数生成均值标准差矩阵图
         if len(all_fold_cms) > 0:
             plot_mean_std_conf_matrix(all_fold_cms, temp_save_path)
+
+        # ==========================================================
+        if args.edl_mode and len(global_adhd_b) > 0:
+            plot_edl_scatter(global_adhd_b, global_adhd_u, temp_save_path)
+            logger.info(f">>> 全局 ADHD 样本 (共{len(global_adhd_b)}个) 的 b-u 散点图绘制完成并已保存！")
 
         # 2. 打印原有的指标总结
         logger.info("\n" + "=" * 30)
