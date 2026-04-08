@@ -332,3 +332,25 @@ def plot_edl_scatter(b_list, u_list, save_path):
     plt.tight_layout()
     plt.savefig(os.path.join(save_path, 'adhd_edl_scatter.png'), dpi=300)
     plt.close()
+
+
+def calculate_ece(y_true, y_prob, n_bins=10):
+    """计算期望校准误差 (Expected Calibration Error)"""
+    # 获取预测类别的概率（置信度）和预测标签
+    confidences = np.max(y_prob, axis=1)
+    predictions = np.argmax(y_prob, axis=1)
+    accuracies = predictions == y_true
+
+    ece = 0.0
+    bin_boundaries = np.linspace(0, 1, n_bins + 1)
+
+    for bin_lower, bin_upper in zip(bin_boundaries[:-1], bin_boundaries[1:]):
+        in_bin = (confidences > bin_lower) & (confidences <= bin_upper)
+        prop_in_bin = in_bin.mean()
+
+        if prop_in_bin > 0:
+            accuracy_in_bin = accuracies[in_bin].mean()
+            avg_confidence_in_bin = confidences[in_bin].mean()
+            ece += np.abs(avg_confidence_in_bin - accuracy_in_bin) * prop_in_bin
+
+    return ece

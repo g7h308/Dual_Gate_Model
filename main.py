@@ -17,18 +17,17 @@ from models.DualBranchModel import DualBranchRecurrentModel
 # 引入新的加载函数
 from dataloader.VFTDataLoader import load_raw_data, augment_data_odd_even, DualModalityDataset, load_excel_channel_data_dual
 
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score, confusion_matrix
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score, confusion_matrix, log_loss
 from torch.nn.functional import dropout, softmax # 引入 softmax 计算概率
 
 from PCMCI import compute_causal_prior_from_channels
 
 from tool import (plot_mean_std_conf_matrix, set_seed, get_logger, close_logger,
                   log_hyperparameters, plot_loss_curve, EarlyStopping, plot_tsne,
-                  edl_mse_loss, softplus_evidence, plot_edl_scatter) # <--- 新增 EDL 工具
+                  edl_mse_loss, softplus_evidence, plot_edl_scatter, calculate_ece) # <--- 新增 EDL 工具
 import pandas as pd # <--- 记得导入 pandas 用于保存 csv
 
 import torch.nn.functional as F
-
 
 
 def calculate_metrics(all_labels, all_preds, all_probs):
@@ -36,6 +35,10 @@ def calculate_metrics(all_labels, all_preds, all_probs):
     precision = precision_score(all_labels, all_preds, zero_division=0)
     recall = recall_score(all_labels, all_preds, zero_division=0)
     f1 = f1_score(all_labels, all_preds, zero_division=0)
+
+    # === 新增：计算 NLL 和 ECE ===
+    nll = log_loss(all_labels, all_probs)
+    ece = calculate_ece(all_labels, all_probs)
 
     # 核心：计算混淆矩阵
     cm = confusion_matrix(all_labels, all_preds, labels=[0, 1])
@@ -51,7 +54,9 @@ def calculate_metrics(all_labels, all_preds, all_probs):
         "recall": recall,
         "f1": f1,
         "auc": auc,
-        "cm": cm  # 返回矩阵用于后续统计
+        "cm": cm,
+        "nll": nll,  # <--- 新增返回
+        "ece": ece   # <--- 新增返回
     }
 
 # ==========================================
@@ -472,10 +477,9 @@ def main():
 
                 if (epoch + 1) % 5 == 0 or epoch == 0:
                     logger.info(f"Fold {fold + 1} Epoch [{epoch + 1}/{args.epochs}] "
-                                f"T_Loss: {train_loss:.4f} | T_Acc: {t_m['acc']:.4f} T_Pre: {t_m['precision']:.4f} T_Rec: {t_m['recall']:.4f} T_F1: {t_m['f1']:.4f} T_AUC: {t_m['auc']:.4f}")
+                                f"T_Loss: {train_loss:.4f} | T_Acc: {t_m['acc']:.4f} T_Pre: {t_m['precision']:.4f} T_Rec: {t_m['recall']:.4f} T_F1: {t_m['f1']:.4f} T_AUC: {t_m['auc']:.4f} T_NLL: {t_m['nll']:.4f} T_ECE: {t_m['ece']:.4f}")
                     logger.info(
-                        f"V_Loss: {val_loss:.4f} | V_Acc: {v_m['acc']:.4f} V_Pre: {v_m['precision']:.4f} V_Rec: {v_m['recall']:.4f} V_F1: {v_m['f1']:.4f} V_AUC: {v_m['auc']:.4f}")
-
+                        f"V_Loss: {val_loss:.4f} | V_Acc: {v_m['acc']:.4f} V_Pre: {v_m['precision']:.4f} V_Rec: {v_m['recall']:.4f} V_F1: {v_m['f1']:.4f} V_AUC: {v_m['auc']:.4f} V_NLL: {v_m['nll']:.4f} V_ECE: {v_m['ece']:.4f}")
                 early_stopping(val_acc=v_m['acc'], val_loss=val_loss, model=model, logger=logger)
                 if early_stopping.early_stop:
                     break
@@ -519,9 +523,9 @@ def main():
                 fold_final_metrics.append(f_m)
                 all_fold_cms.append(f_m['cm'])
                 logger.info(
-                    f"Fold {fold + 1} BEST Result -> Acc: {f_m['acc']:.4f}, Pre: {f_m['precision']:.4f}, Rec: {f_m['recall']:.4f}, F1: {f_m['f1']:.4f}, AUC: {f_m['auc']:.4f}")
+                    f"Fold {fold + 1} BEST Result -> Acc: {f_m['acc']:.4f}, Pre: {f_m['precision']:.4f}, Rec: {f_m['recall']:.4f}, F1: {f_m['f1']:.4f}, AUC: {f_m['auc']:.4f}, NLL: {f_m['nll']:.4f}, ECE: {f_m['ece']:.4f}")
             else:
-                fold_final_metrics.append({"acc": 0, "precision": 0, "recall": 0, "f1": 0, "auc": 0})
+                fold_final_metrics.append({"acc": 0, "precision": 0, "recall": 0, "f1": 0, "auc": 0, "nll": 0, "ece": 0})
 
         # --- 总结 ---
 
@@ -537,7 +541,8 @@ def main():
         # 2. 打印原有的指标总结
         logger.info("\n" + "=" * 30)
         logger.info(f"Final {args.k_folds}-Fold CV Summary:")
-        for m_name in ["acc", "precision", "recall", "f1", "auc"]:
+        # === 列表中加入 "nll" 和 "ece" ===
+        for m_name in ["acc", "precision", "recall", "f1", "auc", "nll", "ece"]:
             vals = [f[m_name] for f in fold_final_metrics]
             logger.info(f"{m_name.upper()}: {np.mean(vals):.4f} ± {np.std(vals):.4f}")
         logger.info("=" * 30)
