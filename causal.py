@@ -6,6 +6,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from torch.utils.data import DataLoader
 from sklearn.model_selection import KFold
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score, log_loss
 
 # 导入你现有的模块
 from dataloader.VFTDataLoader import load_raw_data, augment_data_odd_even, DualModalityDataset, \
@@ -58,10 +59,29 @@ roi_mapping = [
 ]
 
 
+def calculate_ece(confidences, accuracies, n_bins=10):
+    """计算期望校准误差 (Expected Calibration Error)"""
+    ece = 0.0
+    bin_boundaries = np.linspace(0, 1, n_bins + 1)
+    for i in range(n_bins):
+        if i == 0:
+            in_bin = (confidences >= bin_boundaries[i]) & (confidences <= bin_boundaries[i + 1])
+        else:
+            in_bin = (confidences > bin_boundaries[i]) & (confidences <= bin_boundaries[i + 1])
+
+        prop_in_bin = np.mean(in_bin)
+        if prop_in_bin > 0:
+            accuracy_in_bin = np.mean(accuracies[in_bin])
+            avg_confidence_in_bin = np.mean(confidences[in_bin])
+            ece += np.abs(avg_confidence_in_bin - accuracy_in_bin) * prop_in_bin
+    return ece
+
+
 def evaluate_and_get_edl(model, loader, device, A_causal_oxy=None, A_causal_dxy=None):
-    """前向传播并提取 b, u, P"""
+    """前向传播并提取 b, u, P 以及预测结果以便计算指标"""
     model.eval()
     all_b, all_u, all_P = [], [], []
+    all_preds, all_labels, all_probs = [], [], []
     with torch.no_grad():
         for oxy, dxy, labels in loader:
             oxy, dxy, labels = oxy.to(device), dxy.to(device), labels.to(device)
@@ -83,7 +103,13 @@ def evaluate_and_get_edl(model, loader, device, A_causal_oxy=None, A_causal_dxy=
             all_u.extend(uncertainty.cpu().numpy().flatten())
             all_P.extend(max_probs.cpu().numpy().flatten())
 
-    return np.array(all_b), np.array(all_u), np.array(all_P)
+            all_preds.extend(predicted.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
+            # 保存类别 1 的概率，用于计算 AUC 和 NLL
+            all_probs.extend(probs[:, 1].cpu().numpy())
+
+    return np.array(all_b), np.array(all_u), np.array(all_P), np.array(all_preds), np.array(all_labels), np.array(
+        all_probs)
 
 
 def main():
@@ -101,9 +127,9 @@ def main():
     kfold = KFold(n_splits=args.k_folds, shuffle=True, random_state=args.seed)
 
     # 初始化保存所有折结果的字典
-    results = {'original': {'b': [], 'u': [], 'P': []}}
+    results = {'original': {'b': [], 'u': [], 'P': [], 'correct': [], 'fold_metrics': []}}
     for i in range(len(roi_mapping)):
-        results[f'roi_{i}'] = {'b': [], 'u': [], 'P': []}
+        results[f'roi_{i}'] = {'b': [], 'u': [], 'P': [], 'correct': [], 'fold_metrics': []}
 
     for fold, (train_idx, val_idx) in enumerate(kfold.split(X_oxy_all)):
         print(f"\n{'=' * 20} Processing Fold {fold + 1} {'=' * 20}")
@@ -115,7 +141,6 @@ def main():
 
         A_causal_oxy, A_causal_dxy = None, None
         if not args.disable_causal:
-            print("  - Computing Causal Prior for this fold...")
             train_adhd_mask = (y_train_raw == 0)
             train_hc_mask = (y_train_raw == 1)
 
@@ -139,119 +164,245 @@ def main():
             chunk_size=args.chunk_size, edl_mode=args.edl_mode
         ).to(device)
         model.load_state_dict(torch.load(model_path, map_location=device))
-        print(f"  - Model loaded from {model_path}")
 
-        # 3. 提取训练集中的 HC 样本均值用于遮掩 (防数据泄露)
+        # 3. 提取训练集中的 HC 样本均值用于遮掩
         train_hc_mask = (y_all[train_idx] == 1)
         mean_hc_oxy = np.mean(X_oxy_all[train_idx][train_hc_mask], axis=0)
         mean_hc_dxy = np.mean(X_dxy_all[train_idx][train_hc_mask], axis=0)
 
-        # 4. 提取测试集中的 ADHD 样本 (Label == 0)
+        # 4. 提取测试集中的 ADHD 与 HC 样本
         val_adhd_mask = (y_all[val_idx] == 0)
+        val_hc_mask = (y_all[val_idx] == 1)
+
         val_adhd_oxy_raw = X_oxy_all[val_idx][val_adhd_mask]
         val_adhd_dxy_raw = X_dxy_all[val_idx][val_adhd_mask]
         val_adhd_y_raw = y_all[val_idx][val_adhd_mask]
 
-        # Baseline: 测试集 ADHD 未遮挡状态
-        oxy_aug, dxy_aug, y_aug = augment_data_odd_even(val_adhd_oxy_raw, val_adhd_dxy_raw, val_adhd_y_raw)
+        val_hc_oxy_raw = X_oxy_all[val_idx][val_hc_mask]
+        val_hc_dxy_raw = X_dxy_all[val_idx][val_hc_mask]
+        val_hc_y_raw = y_all[val_idx][val_hc_mask]
+
+        # -------------------------------------------------------------
+        # Baseline: 测试集全部 (ADHD + HC) 未遮挡状态
+        val_oxy_orig = np.concatenate([val_adhd_oxy_raw, val_hc_oxy_raw], axis=0)
+        val_dxy_orig = np.concatenate([val_adhd_dxy_raw, val_hc_dxy_raw], axis=0)
+        val_y_orig = np.concatenate([val_adhd_y_raw, val_hc_y_raw], axis=0)
+
+        oxy_aug, dxy_aug, y_aug = augment_data_odd_even(val_oxy_orig, val_dxy_orig, val_y_orig)
         loader_orig = DataLoader(DualModalityDataset(oxy_aug, dxy_aug, y_aug), batch_size=args.batch_size,
                                  shuffle=False)
-        b_orig, u_orig, P_orig = evaluate_and_get_edl(model, loader_orig, device, A_causal_oxy, A_causal_dxy)
+        b_orig, u_orig, P_orig, preds_orig, labels_orig, probs_orig = evaluate_and_get_edl(model, loader_orig, device,
+                                                                                           A_causal_oxy, A_causal_dxy)
 
-        results['original']['b'].extend(b_orig)
-        results['original']['u'].extend(u_orig)
-        results['original']['P'].extend(P_orig)
+        adhd_idx = (labels_orig == 0)
+        orig_is_correct = (preds_orig == labels_orig).astype(int)
 
+        results['original']['b'].extend(b_orig[adhd_idx])
+        results['original']['u'].extend(u_orig[adhd_idx])
+        results['original']['P'].extend(P_orig[adhd_idx])
+        results['original']['correct'].extend(orig_is_correct[adhd_idx])
+
+        # 计算该折 Baseline 指标
+        acc = accuracy_score(labels_orig, preds_orig)
+        pre = precision_score(labels_orig, preds_orig, zero_division=0)
+        rec = recall_score(labels_orig, preds_orig, zero_division=0)
+        f1 = f1_score(labels_orig, preds_orig, zero_division=0)
+        try:
+            auc = roc_auc_score(labels_orig, probs_orig)
+        except:
+            auc = 0.5
+
+        try:
+            nll = log_loss(labels_orig, probs_orig, labels=[0, 1])
+        except:
+            nll = 0.0
+
+        ece = calculate_ece(P_orig, orig_is_correct)
+
+        mean_b, mean_u, mean_P = np.mean(b_orig), np.mean(u_orig), np.mean(P_orig)
+        # 顺序: acc, f1, pre, rec, auc, nll, ece, mean_u, mean_b, mean_P
+        results['original']['fold_metrics'].append([acc, f1, pre, rec, auc, nll, ece, mean_u, mean_b, mean_P])
+
+        print(
+            f"  -> [Unmasked Baseline] ACC: {acc * 100:.2f} | F1: {f1 * 100:.2f} | PRE: {pre * 100:.2f} | REC: {rec * 100:.2f} | AUC: {auc * 100:.2f} | NLL: {nll * 100:.2f} | ECE: {ece * 100:.2f}")
+        print(
+            f"                         mean u: {mean_u * 100:.2f} | mean b: {mean_b * 100:.2f} | mean P: {mean_P * 100:.2f}")
+
+        # -------------------------------------------------------------
         # Masking: 逐个遍历 6 个 ROI 执行遮挡干预
         for roi_idx, channels in enumerate(roi_mapping):
-            print(f"    -> Masking ROI {roi_idx} (Channels: {channels})")
-            val_oxy_masked = val_adhd_oxy_raw.copy()
-            val_dxy_masked = val_adhd_dxy_raw.copy()
+            val_oxy_masked_adhd = val_adhd_oxy_raw.copy()
+            val_dxy_masked_adhd = val_adhd_dxy_raw.copy()
 
             for ch in channels:
                 r, c = coords_map[ch]
-                val_oxy_masked[:, :, r, c] = mean_hc_oxy[:, r, c]
-                val_dxy_masked[:, :, r, c] = mean_hc_dxy[:, r, c]
+                val_oxy_masked_adhd[:, :, r, c] = mean_hc_oxy[:, r, c]
+                val_dxy_masked_adhd[:, :, r, c] = mean_hc_dxy[:, r, c]
 
-            oxy_aug_m, dxy_aug_m, y_aug_m = augment_data_odd_even(val_oxy_masked, val_dxy_masked, val_adhd_y_raw)
+            val_oxy_masked = np.concatenate([val_oxy_masked_adhd, val_hc_oxy_raw], axis=0)
+            val_dxy_masked = np.concatenate([val_dxy_masked_adhd, val_hc_dxy_raw], axis=0)
+            val_y_masked = np.concatenate([val_adhd_y_raw, val_hc_y_raw], axis=0)
+
+            oxy_aug_m, dxy_aug_m, y_aug_m = augment_data_odd_even(val_oxy_masked, val_dxy_masked, val_y_masked)
             loader_m = DataLoader(DualModalityDataset(oxy_aug_m, dxy_aug_m, y_aug_m), batch_size=args.batch_size,
                                   shuffle=False)
 
-            b_m, u_m, P_m = evaluate_and_get_edl(model, loader_m, device, A_causal_oxy, A_causal_dxy)
-            results[f'roi_{roi_idx}']['b'].extend(b_m)
-            results[f'roi_{roi_idx}']['u'].extend(u_m)
-            results[f'roi_{roi_idx}']['P'].extend(P_m)
+            b_m, u_m, P_m, preds_m, labels_m, probs_m = evaluate_and_get_edl(model, loader_m, device, A_causal_oxy,
+                                                                             A_causal_dxy)
+
+            adhd_idx_m = (labels_m == 0)
+            mask_is_correct = (preds_m == labels_m).astype(int)
+
+            results[f'roi_{roi_idx}']['b'].extend(b_m[adhd_idx_m])
+            results[f'roi_{roi_idx}']['u'].extend(u_m[adhd_idx_m])
+            results[f'roi_{roi_idx}']['P'].extend(P_m[adhd_idx_m])
+            results[f'roi_{roi_idx}']['correct'].extend(mask_is_correct[adhd_idx_m])
+
+            acc_m = accuracy_score(labels_m, preds_m)
+            pre_m = precision_score(labels_m, preds_m, zero_division=0)
+            rec_m = recall_score(labels_m, preds_m, zero_division=0)
+            f1_m = f1_score(labels_m, preds_m, zero_division=0)
+            try:
+                auc_m = roc_auc_score(labels_m, probs_m)
+            except:
+                auc_m = 0.5
+
+            try:
+                nll_m = log_loss(labels_m, probs_m, labels=[0, 1])
+            except:
+                nll_m = 0.0
+
+            ece_m = calculate_ece(P_m, mask_is_correct)
+
+            mean_b_m, mean_u_m, mean_P_m = np.mean(b_m), np.mean(u_m), np.mean(P_m)
+            results[f'roi_{roi_idx}']['fold_metrics'].append(
+                [acc_m, f1_m, pre_m, rec_m, auc_m, nll_m, ece_m, mean_u_m, mean_b_m, mean_P_m])
+
+            print(
+                f"  -> [Masked ROI {roi_idx}]      ACC: {acc_m * 100:.2f} | F1: {f1_m * 100:.2f} | PRE: {pre_m * 100:.2f} | REC: {rec_m * 100:.2f} | AUC: {auc_m * 100:.2f} | NLL: {nll_m * 100:.2f} | ECE: {ece_m * 100:.2f}")
+            print(
+                f"                         mean u: {mean_u_m * 100:.2f} | mean b: {mean_b_m * 100:.2f} | mean P: {mean_P_m * 100:.2f}")
 
     # ==========================================================
-    # 5. 结果保存与可视化 (重点修改的颜色搭配)
+    # 输出五折交叉验证平均指标与标准差
     # ==========================================================
-    print("\n========== 开始生成并保存结果与图像 ==========")
+    print("\n" + "=" * 80)
+    print("========= 五折交叉验证 平均评估指标 ± 标准差 =========")
+    print("=" * 80)
+    for key in results.keys():
+        # avg_metrics 和 std_metrics 各项乘以 100
+        avg_m = np.mean(results[key]['fold_metrics'], axis=0) * 100
+        std_m = np.std(results[key]['fold_metrics'], axis=0) * 100
 
-    # 构建主输出目录: model_dir/causal_resultandimages
+        # 顺序: [0:acc, 1:f1, 2:pre, 3:rec, 4:auc, 5:nll, 6:ece, 7:mean_u, 8:mean_b, 9:mean_P]
+        print(f"[{key.upper()}]")
+        print(
+            f"  ACC: {avg_m[0]:.2f}±{std_m[0]:.2f} | F1: {avg_m[1]:.2f}±{std_m[1]:.2f} | PRE: {avg_m[2]:.2f}±{std_m[2]:.2f} | REC: {avg_m[3]:.2f}±{std_m[3]:.2f} | AUC: {avg_m[4]:.2f}±{std_m[4]:.2f} | NLL: {avg_m[5]:.2f}±{std_m[5]:.2f} | ECE: {avg_m[6]:.2f}±{std_m[6]:.2f}")
+        print(
+            f"  mean u: {avg_m[7]:.2f}±{std_m[7]:.2f} | mean b: {avg_m[8]:.2f}±{std_m[8]:.2f} | mean P: {avg_m[9]:.2f}±{std_m[9]:.2f}")
+        print("-" * 80)
+
+    # ==========================================================
+    # 5. 结果保存与散点图可视化 (仅含 ADHD)
+    # ==========================================================
+    print("\n========== 开始生成并保存散点图结果 ==========")
+
     base_out_dir = os.path.join(args.model_dir, 'causal_resultandimages')
     os.makedirs(base_out_dir, exist_ok=True)
     print(f"主输出目录已创建/存在: {base_out_dir}")
 
     font_family = PLOT_FONT_CONFIG['family']
 
-    # 提取总体的 Baseline 数据
     orig_b = np.array(results['original']['b'])
     orig_u = np.array(results['original']['u'])
     orig_P = np.array(results['original']['P'])
+    orig_correct = np.array(results['original']['correct'])
 
-    for roi_idx in range(len(roi_mapping)):
-        # 为当前 ROI 创建专属子文件夹
-        roi_dir = os.path.join(base_out_dir, f'ROI_{roi_idx}')
-        os.makedirs(roi_dir, exist_ok=True)
+    excel_save_path = os.path.join(base_out_dir, 'combined_roi_results.xlsx')
 
-        # 提取当前 ROI 遮蔽后的数据
-        mask_b = np.array(results[f'roi_{roi_idx}']['b'])
-        mask_u = np.array(results[f'roi_{roi_idx}']['u'])
-        mask_P = np.array(results[f'roi_{roi_idx}']['P'])
+    try:
+        with pd.ExcelWriter(excel_save_path) as writer:
+            for roi_idx in range(len(roi_mapping)):
+                roi_dir = os.path.join(base_out_dir, f'ROI_{roi_idx}')
+                os.makedirs(roi_dir, exist_ok=True)
 
-        # ---------------- (1) 保存专属 CSV ----------------
-        df = pd.DataFrame({
-            'Original_b': orig_b,
-            'Original_u': orig_u,
-            'Original_P': orig_P,
-            'Masked_b': mask_b,
-            'Masked_u': mask_u,
-            'Masked_P': mask_P
-        })
-        csv_save_path = os.path.join(roi_dir, f'result_roi_{roi_idx}.csv')
-        df.to_csv(csv_save_path, index_label='Sample_Index')
+                mask_b = np.array(results[f'roi_{roi_idx}']['b'])
+                mask_u = np.array(results[f'roi_{roi_idx}']['u'])
+                mask_P = np.array(results[f'roi_{roi_idx}']['P'])
+                mask_correct = np.array(results[f'roi_{roi_idx}']['correct'])
 
-        # ---------------- (2) 绘制并保存散点图 (应用新颜色方案) ----------------
-        plt.figure(figsize=(9, 7))
+                df = pd.DataFrame({
+                    'Original_b': orig_b,
+                    'Original_u': orig_u,
+                    'Original_P': orig_P,
+                    'Original_Correct': orig_correct,
+                    'Masked_b': mask_b,
+                    'Masked_u': mask_u,
+                    'Masked_P': mask_P,
+                    'Masked_Correct': mask_correct
+                })
 
-        # 原始 ADHD 点: 修改为红色 (增加透明度和白色边框以增强清晰度)
-        plt.scatter(orig_b, orig_u, c='red', alpha=0.4, edgecolors='white', label='Original ADHD', s=60)
-        # 遮盖后 ADHD 点: 修改为深蓝色 (应用经典的学术蓝)
-        plt.scatter(mask_b, mask_u, c='#1f77b4', alpha=0.8, edgecolors='white', label=f'Masked ROI {roi_idx}', s=80)
+                # 新增 Delta_u 列
+                df['Delta_u'] = df['Masked_u'] - df['Original_u']
 
-        # 箭头位移: 修改为中性灰色 (指示变化而不干扰整体分布观察)
-        for i in range(len(orig_b)):
-            plt.arrow(orig_b[i], orig_u[i], mask_b[i] - orig_b[i], mask_u[i] - orig_u[i],
-                      color='gray', alpha=0.25, width=0.0015, head_width=0.01)
+                # 计算指定的均值并在最后添加一行
+                mean_row_vals = df[
+                    ['Original_b', 'Original_u', 'Original_P', 'Masked_b', 'Masked_u', 'Masked_P', 'Delta_u']].mean()
+                df.loc['Mean'] = np.nan  # 先将这行全部填充为 NaN
+                for col in mean_row_vals.index:
+                    df.loc['Mean', col] = mean_row_vals[col]
 
-        plt.xlabel('Belief (b)', fontdict={'family': font_family, 'size': 18})
-        plt.ylabel('Uncertainty (u)', fontdict={'family': font_family, 'size': 18})
-        plt.title(f'Causal Masking Shift: ROI {roi_idx} (94 ADHD Samples)',
-                  fontdict={'family': font_family, 'size': 20})
+                # 1. 保存 CSV
+                csv_save_path = os.path.join(roi_dir, f'result_roi_{roi_idx}.csv')
+                df.to_csv(csv_save_path, index_label='Sample_Index')
 
-        plt.xticks(fontname=font_family, fontsize=14)
-        plt.yticks(fontname=font_family, fontsize=14)
-        plt.legend(prop={'family': font_family, 'size': 14})
-        plt.grid(True, linestyle='--', alpha=0.4)
-        plt.tight_layout()
+                # 2. 写入 Excel 的 Sheet
+                df.to_excel(writer, sheet_name=f'ROI_{roi_idx}', index_label='Sample_Index')
 
-        png_save_path = os.path.join(roi_dir, f'u_b_scatter_roi_{roi_idx}.png')
-        plt.savefig(png_save_path, dpi=300)
-        plt.close()
+                # --- 绘制散点图 (绘图时排除 'Mean' 行的数据) ---
+                orig_b_plot = orig_b
+                orig_u_plot = orig_u
+                mask_b_plot = mask_b
+                mask_u_plot = mask_u
 
-        print(f"  - ROI {roi_idx} 处理完成，文件已存入: {roi_dir}")
+                plt.figure(figsize=(9, 7))
+                plt.scatter(orig_b_plot, orig_u_plot, c='red', alpha=0.4, edgecolors='white', label='Original ADHD',
+                            s=60)
+                plt.scatter(mask_b_plot, mask_u_plot, c='#1f77b4', alpha=0.8, edgecolors='white',
+                            label=f'Masked ROI {roi_idx}', s=80)
 
-    print("\n✅ 所有因果消融结果保存完毕！")
+                for i in range(len(orig_b_plot)):
+                    plt.arrow(orig_b_plot[i], orig_u_plot[i], mask_b_plot[i] - orig_b_plot[i],
+                              mask_u_plot[i] - orig_u_plot[i],
+                              color='gray', alpha=0.25, width=0.0015, head_width=0.01)
+
+                plt.xlabel('Belief (b)', fontdict={'family': font_family, 'size': 18})
+                plt.ylabel('Uncertainty (u)', fontdict={'family': font_family, 'size': 18})
+                plt.title(f'Causal Masking Shift: ROI {roi_idx} (ADHD Samples)',
+                          fontdict={'family': font_family, 'size': 20})
+
+                plt.xticks(fontname=font_family, fontsize=14)
+                plt.yticks(fontname=font_family, fontsize=14)
+                plt.legend(prop={'family': font_family, 'size': 14})
+                plt.grid(True, linestyle='--', alpha=0.4)
+                plt.tight_layout()
+
+                png_save_path = os.path.join(roi_dir, f'u_b_scatter_roi_{roi_idx}.png')
+                plt.savefig(png_save_path, dpi=300)
+                plt.close()
+
+                print(f"  - ROI {roi_idx} 散点图及结果文件保存完毕")
+
+        print(f"\n  - 所有 ROI 的汇总数据已被写入到独立 Sheet 文件中: {excel_save_path}")
+        print("\n✅ 所有因果消融指标与绘图保存完毕！")
+
+    except PermissionError as e:
+        print("\n" + "❌" * 20)
+        print("保存失败：文件正在被占用！")
+        print("请检查你是否在 Excel 或 WPS 中打开了 CSV 或者是 Excel 文件。")
+        print("请关闭所有相关表格文件后重新运行本程序。")
+        print(f"详细报错信息: {e}")
+        print("❌" * 20 + "\n")
 
 
 if __name__ == '__main__':
