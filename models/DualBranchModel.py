@@ -102,7 +102,8 @@ class DualBranchRecurrentModel(nn.Module):
 
         return f_t_hbo2, f_t_hbr
 
-    def forward(self, hbo2_raw, hbr_raw, A_causal_oxy=None, A_causal_dxy=None, return_features=False):
+    def forward(self, hbo2_raw, hbr_raw, A_causal_oxy=None, A_causal_dxy=None,
+                return_features=False, return_step_features=False, intervene_dict=None):
         """
         主循环逻辑
         Input:
@@ -122,6 +123,9 @@ class DualBranchRecurrentModel(nn.Module):
 
         final_hbo2 = None
         final_hbr = None
+
+        step_features_hbo2 = []
+        step_features_hbr = []
 
         # 确保时间步长能被 chunk_size 整除，或者做好填充处理
         # 这里假设输入数据的长度是 chunk_size (10) 的倍数
@@ -148,6 +152,30 @@ class DualBranchRecurrentModel(nn.Module):
                 A_causal_oxy=A_causal_oxy,
                 A_causal_dxy=A_causal_dxy
             )
+
+            # =======================================================
+            # 新增：时间因果干预逻辑 (Temporal Intervention)
+            # =======================================================
+            step_idx = t // step  # 当前是第几个步长 (0, 1, 2...)
+            if intervene_dict is not None and step_idx in intervene_dict:
+                # 提取 HC 该步的均值，并转移到当前设备
+                hc_hbo2 = intervene_dict[step_idx]['hbo2'].to(out_hbo2.device)
+                hc_hbr = intervene_dict[step_idx]['hbr'].to(out_hbr.device)
+
+                # hc_hbo2 原本是 [N, D] 形状，扩展到和 out_hbo2 相同的 Batch 维度 [B, N, D]
+                out_hbo2 = hc_hbo2.unsqueeze(0).expand_as(out_hbo2)
+                out_hbr = hc_hbr.unsqueeze(0).expand_as(out_hbr)
+
+                # 关键：由于 forward_one_step 内的 fusion_module 已经把原始特征存入池子了，
+                # 我们必须把池子里的最新特征替换为 HC 均值，保证记忆流传递的是干预后的健康特征！
+                self.fusion_hbo2.feature_pool[-1] = out_hbo2
+                self.fusion_hbr.feature_pool[-1] = out_hbr
+            # =======================================================
+
+            # 收集每个 step 的特征
+            if return_step_features:
+                step_features_hbo2.append(out_hbo2)
+                step_features_hbr.append(out_hbr)
 
             # 如果是最后一次循环，保存结果
             if t == time_steps - step:
@@ -179,6 +207,10 @@ class DualBranchRecurrentModel(nn.Module):
             output = logits
         if return_features:
             return output, combined_feat  # 同时返回预测结果和高维特征
+
+        if return_step_features:
+            # 形状：[B, num_steps, N, D]
+            return torch.stack(step_features_hbo2, dim=1), torch.stack(step_features_hbr, dim=1)
         return output
 
 
