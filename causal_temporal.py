@@ -141,9 +141,9 @@ def main():
         "Seg_500_800": range(p2, num_steps)
     }
 
-    results = {'Baseline': {'b': [], 'u': [], 'P': [], 'fold_metrics': []}}
+    results = {'Baseline': {'b': [], 'u': [], 'P': [], 'fold_metrics': [], 'is_correct': []}}
     for seg_name in segments.keys():
-        results[seg_name] = {'b': [], 'u': [], 'P': [], 'fold_metrics': []}
+        results[seg_name] = {'b': [], 'u': [], 'P': [], 'fold_metrics': [], 'is_correct': []}
 
     kfold = KFold(n_splits=args.k_folds, shuffle=True, random_state=args.seed)
 
@@ -226,6 +226,7 @@ def main():
             results[key]['b'].extend(b[adhd_idx])
             results[key]['u'].extend(u[adhd_idx])
             results[key]['P'].extend(P[adhd_idx])
+            results[key]['is_correct'].extend(is_correct[adhd_idx])
 
             print(
                 f"  -> [{log_prefix}] ACC: {acc * 100:.2f} | F1: {f1 * 100:.2f} | PRE: {pre * 100:.2f} | REC: {rec * 100:.2f} | AUC: {auc * 100:.2f} | NLL: {nll * 100:.2f} | ECE: {ece * 100:.2f}")
@@ -259,7 +260,12 @@ def main():
     excel_save_path = os.path.join(out_dir, 'temporal_ablation_results.xlsx')
     with pd.ExcelWriter(excel_save_path) as writer:
         for key in results.keys():
-            df = pd.DataFrame({'b': results[key]['b'], 'u': results[key]['u'], 'P': results[key]['P']})
+            df = pd.DataFrame({
+                'b': results[key]['b'],
+                'u': results[key]['u'],
+                'P': results[key]['P'],
+                'is_correct': results[key]['is_correct']  # <--- 新增这一列
+            })
             df.to_excel(writer, sheet_name=key, index=False)
 
     print(f"\n✅ 完成！结果表已保存至: {excel_save_path}")
