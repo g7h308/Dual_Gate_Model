@@ -342,16 +342,6 @@ def main():
                     'Masked_Correct': mask_correct
                 })
 
-                # 新增 Delta_u 列
-                df['Delta_u'] = df['Masked_u'] - df['Original_u']
-
-                # 计算指定的均值并在最后添加一行
-                mean_row_vals = df[
-                    ['Original_b', 'Original_u', 'Original_P', 'Masked_b', 'Masked_u', 'Masked_P', 'Delta_u']].mean()
-                df.loc['Mean'] = np.nan  # 先将这行全部填充为 NaN
-                for col in mean_row_vals.index:
-                    df.loc['Mean', col] = mean_row_vals[col]
-
                 # 1. 保存 CSV
                 csv_save_path = os.path.join(roi_dir, f'result_roi_{roi_idx}.csv')
                 df.to_csv(csv_save_path, index_label='Sample_Index')
@@ -359,21 +349,14 @@ def main():
                 # 2. 写入 Excel 的 Sheet
                 df.to_excel(writer, sheet_name=f'ROI_{roi_idx}', index_label='Sample_Index')
 
-                # --- 绘制散点图 (绘图时排除 'Mean' 行的数据) ---
-                orig_b_plot = orig_b
-                orig_u_plot = orig_u
-                mask_b_plot = mask_b
-                mask_u_plot = mask_u
-
+                # --- 绘制散点图 ---
                 plt.figure(figsize=(9, 7))
-                plt.scatter(orig_b_plot, orig_u_plot, c='red', alpha=0.4, edgecolors='white', label='Original ADHD',
-                            s=60)
-                plt.scatter(mask_b_plot, mask_u_plot, c='#1f77b4', alpha=0.8, edgecolors='white',
-                            label=f'Masked ROI {roi_idx}', s=80)
+                plt.scatter(orig_b, orig_u, c='red', alpha=0.4, edgecolors='white', label='Original ADHD', s=60)
+                plt.scatter(mask_b, mask_u, c='#1f77b4', alpha=0.8, edgecolors='white', label=f'Masked ROI {roi_idx}',
+                            s=80)
 
-                for i in range(len(orig_b_plot)):
-                    plt.arrow(orig_b_plot[i], orig_u_plot[i], mask_b_plot[i] - orig_b_plot[i],
-                              mask_u_plot[i] - orig_u_plot[i],
+                for i in range(len(orig_b)):
+                    plt.arrow(orig_b[i], orig_u[i], mask_b[i] - orig_b[i], mask_u[i] - orig_u[i],
                               color='gray', alpha=0.25, width=0.0015, head_width=0.01)
 
                 plt.xlabel('Belief (b)', fontdict={'family': font_family, 'size': 18})
