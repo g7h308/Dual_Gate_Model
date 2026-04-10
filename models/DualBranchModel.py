@@ -68,8 +68,10 @@ class DualBranchRecurrentModel(nn.Module):
         self.fusion_hbo2 = TemporalFusionModule(embed_dim, k_memory)
         self.fusion_hbr = TemporalFusionModule(embed_dim, k_memory)
 
+        self.num_steps = 80
+
         self.classifier = nn.Sequential(
-            nn.Linear(embed_dim * 2, embed_dim),
+            nn.Linear(self.num_steps * embed_dim * 2, embed_dim),
             nn.GELU(),
             nn.Linear(embed_dim, num_classes)
         )
@@ -94,123 +96,83 @@ class DualBranchRecurrentModel(nn.Module):
 
             x1, x2 = self.bie_layers[i](x1, x2)
 
-        # 2. 进入 Fusion Module 与历史记忆融合
-        # 注意: Fusion Module 内部通常需要处理 [B, T*N, D] 或者 [B, D]
-        # 这里假设 Fusion Module 能够处理 view 后的特征
-        f_t_hbo2 = self.fusion_hbo2(x1)
-        f_t_hbr = self.fusion_hbr(x2)
 
-        return f_t_hbo2, f_t_hbr
+
+        return x1, x2
 
     def forward(self, hbo2_raw, hbr_raw, A_causal_oxy=None, A_causal_dxy=None,
                 return_features=False, return_step_features=False, intervene_dict=None):
-        """
-        主循环逻辑
-        Input:
-          hbo2_raw: [Batch, Time, H, W] (原始数据)
-          hbr_raw:  [Batch, Time, H, W]
-        """
-        # 1. 增加 Channel 维度: [B, T, H, W] -> [B, T, 1, H, W]
         if hbo2_raw.dim() == 4:
             hbo2_raw = hbo2_raw.unsqueeze(2)
             hbr_raw = hbr_raw.unsqueeze(2)
 
         batch_size, time_steps, _, _, _ = hbo2_raw.shape
 
-        # 重置记忆池
-        self.fusion_hbo2.reset_memory()
-        self.fusion_hbr.reset_memory()
+        # 【删】删除了重置记忆池的代码 (self.fusion_hbo2.reset_memory()等)
+        # 【删】删除了 final_hbo2 = None 相关的单变量声明
 
-        final_hbo2 = None
-        final_hbr = None
-
+        # 【增】新增用于收集每个时间步特征的列表
         step_features_hbo2 = []
         step_features_hbr = []
 
-        # 确保时间步长能被 chunk_size 整除，或者做好填充处理
-        # 这里假设输入数据的长度是 chunk_size (10) 的倍数
         step = self.chunk_size
 
-        # --- The Loop ---
         for t in range(0, time_steps, step):
-            # 1. 切片 (Slice Chunk): [B, 10, 1, H, W]
-            # 注意处理最后不足 10 帧的情况 (这里暂按整除处理)
             if t + step > time_steps:
                 break
 
             chunk_hbo2 = hbo2_raw[:, t: t + step, ...]
             chunk_hbr = hbr_raw[:, t: t + step, ...]
 
-            # 2. Embedding (Raw -> Token): [B, 10, N, D]
-            # 这一步加入了 Patch Embedding 和 Position Embedding
             emb_hbo2 = self.video_wrapper_hbo(chunk_hbo2)
             emb_hbr = self.video_wrapper_hbr(chunk_hbr)
 
-            # 3. Backbone Step
             out_hbo2, out_hbr = self.forward_one_step(
                 emb_hbo2, emb_hbr,
                 A_causal_oxy=A_causal_oxy,
                 A_causal_dxy=A_causal_dxy
             )
 
-            # =======================================================
-            # 新增：时间因果干预逻辑 (Temporal Intervention)
-            # =======================================================
-            step_idx = t // step  # 当前是第几个步长 (0, 1, 2...)
+            # 【改】保留时间因果干预逻辑，但移除对 fusion module 的依赖
+            step_idx = t // step
             if intervene_dict is not None and step_idx in intervene_dict:
-                # 提取 HC 该步的均值，并转移到当前设备
                 hc_hbo2 = intervene_dict[step_idx]['hbo2'].to(out_hbo2.device)
                 hc_hbr = intervene_dict[step_idx]['hbr'].to(out_hbr.device)
 
-                # hc_hbo2 原本是 [N, D] 形状，扩展到和 out_hbo2 相同的 Batch 维度 [B, N, D]
                 out_hbo2 = hc_hbo2.unsqueeze(0).expand_as(out_hbo2)
                 out_hbr = hc_hbr.unsqueeze(0).expand_as(out_hbr)
 
-                # 关键：由于 forward_one_step 内的 fusion_module 已经把原始特征存入池子了，
-                # 我们必须把池子里的最新特征替换为 HC 均值，保证记忆流传递的是干预后的健康特征！
-                self.fusion_hbo2.feature_pool[-1] = out_hbo2
-                self.fusion_hbr.feature_pool[-1] = out_hbr
-            # =======================================================
+                # 【删】删除了将干预特征写入 self.fusion_hbo2.feature_pool[-1] 的代码，因为记忆池已消融
 
-            # 收集每个 step 的特征
-            if return_step_features:
-                step_features_hbo2.append(out_hbo2)
-                step_features_hbr.append(out_hbr)
+            # 【增】对每个 chunk 的时空 Token 维度 (dim=1) 求平均，得到当前步的表征 [B, D]
+            feat_hbo2 = out_hbo2.mean(dim=1)
+            feat_hbr = out_hbr.mean(dim=1)
 
-            # 如果是最后一次循环，保存结果
-            if t == time_steps - step:
-                final_hbo2 = out_hbo2
-                final_hbr = out_hbr
+            # 【增】将每一步的特征收集到列表中
+            step_features_hbo2.append(feat_hbo2)
+            step_features_hbr.append(feat_hbr)
 
-        # --- Classification ---
-        # 此时 final_hbo2 应该包含了融合后的特征
-        # 假设 output 是 [B, N, D] 或者 [B, T*N, D]，我们需要聚合
+        # 【改】将所有 step 的输出在特征维度进行拼接，形状从 len=num_steps 的 [B, D] 变为 [B, num_steps * D]
+        all_steps_hbo2 = torch.cat(step_features_hbo2, dim=1)
+        all_steps_hbr = torch.cat(step_features_hbr, dim=1)
 
-        # 简单做 Mean Pooling
-        if final_hbo2.dim() == 3:  # [B, L, D]
-            feat_1 = final_hbo2.mean(dim=1)
-            feat_2 = final_hbr.mean(dim=1)
-        else:
-            feat_1 = final_hbo2
-            feat_2 = final_hbr
+        # 【改】拼接双模态特征，形状变为 [B, num_steps * D * 2]
+        combined_feat = torch.cat([all_steps_hbo2, all_steps_hbr], dim=-1)
 
-        # 拼接
-        combined_feat = torch.cat([feat_1, feat_2], dim=-1)  # [B, 2*D]
-
-        # 分类
         logits = self.classifier(combined_feat)
 
         if self.edl_mode:
-            # EDL模式下，将 logits 通过 softplus 转换为非负的证据(Evidence)
             output = F.softplus(logits)
         else:
             output = logits
+
         if return_features:
-            return output, combined_feat  # 同时返回预测结果和高维特征
+            return output, combined_feat
 
         if return_step_features:
-            # 形状：[B, num_steps, N, D]
+            # 【改】直接堆叠收集到的步特征返回，形状为 [B, num_steps, D]
             return torch.stack(step_features_hbo2, dim=1), torch.stack(step_features_hbr, dim=1)
+
         return output
 
 

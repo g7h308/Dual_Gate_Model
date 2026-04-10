@@ -18,7 +18,7 @@ from tool import set_seed
 def get_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--data_path', type=str, default='./data/VFT')
-    parser.add_argument('--model_dir', type=str, default='./checkpoints/causal_EDL')
+    parser.add_argument('--model_dir', type=str, default='./checkpoints/20260410_155626_causal_temporal')
     parser.add_argument('--num_classes', type=int, default=2)
     parser.add_argument('--hidden_dims', type=int, default=64)
     parser.add_argument('--head', type=int, default=2)
@@ -27,7 +27,7 @@ def get_args():
     parser.add_argument('--dropout', type=float, default=0.4)
     parser.add_argument('--attn_drop', type=float, default=0.4)
     parser.add_argument('--batch_size', type=int, default=16)
-    parser.add_argument('--seed', type=int, default=0)
+    parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
     parser.add_argument('--k_folds', type=int, default=5)
     parser.add_argument('--roi_mode', type=str, default='original')

@@ -206,7 +206,7 @@ def get_args():
     parser.add_argument('--lr', type=float, default=5e-4)
     parser.add_argument('--weight_decay', type=float, default=1e-2,help='l2正则化系数')
     parser.add_argument('--patience', type=int, default=10)
-    parser.add_argument('--seed', type=int, default=0)
+    parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--optim_patience', type=int, default=5,help='每隔optim_patience轮lr减半')
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
     parser.add_argument('--save_dir', type=str, default='./checkpoints')
